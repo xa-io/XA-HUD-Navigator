@@ -1,0 +1,22 @@
+{
+  "Author": "XA",
+  "Name": "XA HUD Navigator",
+  "InternalName": "XAHudNavigator",
+  "RepoUrl": "https://github.com/xa-io/XA-HUD-Navigator",
+  "AssemblyVersion": "0.0.0.2",
+  "Punchline": "Finding stuff is hard.",
+  "Description": "Finding stuff is hard.",
+  "IconUrl": "images/icon.png",
+  "ApplicableVersion": "any",
+  "DalamudApiLevel": 14,
+  "AcceptsFeedback": false,
+  "Tags": [
+    "xa",
+    "hud",
+    "addon",
+    "inspector",
+    "overlay",
+    "debug",
+    "utility"
+  ]
+}
