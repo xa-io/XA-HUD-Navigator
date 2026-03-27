@@ -6,6 +6,7 @@ using FFXIVClientStructs.FFXIV.Application.Network.WorkDefinitions;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
+using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using Lumina.Excel.Sheets;
 
@@ -27,6 +28,8 @@ public sealed unsafe class ClientStructsSheetService
         new ClientStructsSheetDefinition("Retainers", "Retainers", "Retainer roster and venture summary data from RetainerManager.", "var rm = RetainerManager.Instance();", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Housing", "Housing", "Current and owned-house state from HousingManager.", "var hm = HousingManager.Instance();"),
         new ClientStructsSheetDefinition("InfoModule", "Social/UI", "InfoModule and InfoProxy availability state.", "var infoModule = InfoModule.Instance();"),
+        new ClientStructsSheetDefinition("Linkshell", "Social/UI", "Normal Linkshell slots from InfoProxyLinkshell.", "var linkshell = (InfoProxyLinkshell*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.Linkshell);", SupportsWindowing: true),
+        new ClientStructsSheetDefinition("Cross-world Linkshell", "Social/UI", "Cross-world Linkshell slots from InfoProxyCrossWorldLinkshell.", "var cwls = (InfoProxyCrossWorldLinkshell*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.CrossWorldLinkshell);", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Item Search Listings", "Market", "General marketboard listings cached in InfoProxyItemSearch.", "var itemSearch = (InfoProxyItemSearch*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.ItemSearch);", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Retainer Listings", "Market", "Last targeted retainer listings cached in InfoProxyItemSearch.", "var itemSearch = (InfoProxyItemSearch*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.ItemSearch);", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Player Retainers", "Market", "Player retainer market cache from InfoProxyItemSearch.", "var itemSearch = (InfoProxyItemSearch*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.ItemSearch);", SupportsWindowing: true),
@@ -62,6 +65,8 @@ public sealed unsafe class ClientStructsSheetService
             "Retainers" => ReadRetainers(definition, request),
             "Housing" => ReadHousing(definition),
             "InfoModule" => ReadInfoModule(definition),
+            "Linkshell" => ReadLinkshell(definition, request),
+            "Cross-world Linkshell" => ReadCrossWorldLinkshell(definition, request),
             "Item Search Listings" => ReadItemSearchListings(definition, request),
             "Retainer Listings" => ReadRetainerListings(definition, request),
             "Player Retainers" => ReadPlayerRetainers(definition, request),
@@ -485,6 +490,8 @@ public sealed unsafe class ClientStructsSheetService
         if (infoModule == null)
             return CreateEmptySnapshot(definition, "InfoModule.Instance() returned null.");
 
+        var linkshellAvailable = infoModule->GetInfoProxyById(InfoProxyId.Linkshell) != null;
+        var crossWorldLinkshellAvailable = infoModule->GetInfoProxyById(InfoProxyId.CrossWorldLinkshell) != null;
         var itemSearchAvailable = infoModule->GetInfoProxyById(InfoProxyId.ItemSearch) != null;
         var freeCompanyAvailable = infoModule->GetInfoProxyById(InfoProxyId.FreeCompany) != null;
 
@@ -499,9 +506,105 @@ public sealed unsafe class ClientStructsSheetService
                 SummaryRow("LocalCharName", infoModule->LocalCharName.ToString(), infoModule->LocalCharName.ToString(), "Utf8String local character name"),
                 SummaryRow("OnlineStatusFlags", infoModule->OnlineStatusFlags, infoModule->OnlineStatusFlags, "Raw online status bitmask"),
                 SummaryRow("IsInCrossWorldDuty()", infoModule->IsInCrossWorldDuty(), infoModule->IsInCrossWorldDuty(), "Cross-world duty helper"),
+                SummaryRow("LinkshellProxyLoaded", linkshellAvailable, linkshellAvailable, "GetInfoProxyById(Linkshell) != null"),
+                SummaryRow("CrossWorldLinkshellProxyLoaded", crossWorldLinkshellAvailable, crossWorldLinkshellAvailable, "GetInfoProxyById(CrossWorldLinkshell) != null"),
                 SummaryRow("ItemSearchProxyLoaded", itemSearchAvailable, itemSearchAvailable, "GetInfoProxyById(ItemSearch) != null"),
                 SummaryRow("FreeCompanyProxyLoaded", freeCompanyAvailable, freeCompanyAvailable, "GetInfoProxyById(FreeCompany) != null")
             });
+    }
+
+    private ClientStructsSheetSnapshot ReadLinkshell(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
+    {
+        var infoModule = InfoModule.Instance();
+        if (infoModule == null)
+            return CreateEmptySnapshot(definition, "InfoModule.Instance() returned null.");
+
+        var proxy = (InfoProxyLinkshell*)infoModule->GetInfoProxyById(InfoProxyId.Linkshell);
+        if (proxy == null)
+            return CreateEmptySnapshot(definition, "InfoProxyLinkshell is not loaded.");
+
+        var selectedIndex = GetSelectedLinkshellIndex();
+        const int totalRows = 8;
+        var columns = CreateColumns(
+            Column("Slot", "Index", "Zero-based Linkshell slot index", 60f),
+            Column("Channel", "LS #", "User-facing Linkshell channel number", 72f),
+            Column("Id", "ulong", "Linkshell id from InfoProxyLinkshell entry", 140f),
+            Column("ChatId", "ulong", "Linkshell chat id from InfoProxyLinkshell entry", 140f),
+            Column("Name", "CStringPointer", "Resolved Linkshell display name", 220f),
+            Column("Flags", "uint", "Raw Linkshell flags field", 90f),
+            Column("Active", "bool", "Whether this row matches ActiveLinkShellIndex", 72f),
+            Column("Selected", "bool", "Whether this row matches AgentLinkshell.SelectedLSIndex", 82f));
+
+        var visibleRows = new List<ClientStructsSheetRow>();
+        BuildWindow(totalRows, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
+        for (var offset = 0; offset < rowsToLoad; offset++)
+        {
+            var rowIndex = startIndex + offset;
+            var entry = proxy->GetLinkshellInfo((uint)rowIndex);
+            if (entry == null)
+                continue;
+
+            var name = entry->Id == 0 ? string.Empty : proxy->GetLinkshellName(entry->Id).ToString();
+            var isActive = proxy->ActiveLinkShellIndex == (uint)rowIndex;
+            var isSelected = selectedIndex.HasValue && selectedIndex.Value == rowIndex;
+            visibleRows.Add(CreateRow(
+                rowIndex,
+                (uint)(rowIndex + 1),
+                Cell(rowIndex),
+                Cell(rowIndex + 1),
+                Cell(entry->Id),
+                Cell(entry->ChatId),
+                Cell(name, entry->Id),
+                Cell(entry->Flags),
+                Cell(isActive),
+                Cell(isSelected)));
+        }
+
+        var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {totalRows} • ActiveLinkShellIndex: {proxy->ActiveLinkShellIndex} • SelectedLSIndex: {FormatOptionalIndex(selectedIndex)}";
+        return CreateSnapshot(definition, columns, visibleRows, totalRows, startIndex, request.RowCount, $"Pointer: {FormatPointer(proxy)}", message);
+    }
+
+    private ClientStructsSheetSnapshot ReadCrossWorldLinkshell(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
+    {
+        var infoModule = InfoModule.Instance();
+        if (infoModule == null)
+            return CreateEmptySnapshot(definition, "InfoModule.Instance() returned null.");
+
+        var proxy = (InfoProxyCrossWorldLinkshell*)infoModule->GetInfoProxyById(InfoProxyId.CrossWorldLinkshell);
+        if (proxy == null)
+            return CreateEmptySnapshot(definition, "InfoProxyCrossWorldLinkshell is not loaded.");
+
+        var selectedIndex = GetSelectedCrossWorldLinkshellIndex();
+        const int totalRows = 8;
+        var columns = CreateColumns(
+            Column("Slot", "Index", "Zero-based Cross-world Linkshell slot index", 60f),
+            Column("Channel", "CWLS #", "User-facing Cross-world Linkshell channel number", 82f),
+            Column("Name", "Utf8String", "Cross-world Linkshell display name", 220f),
+            Column("Membership", "ushort", "Membership type from the proxy entry", 100f),
+            Column("FoundationTime", "uint", "Foundation timestamp from the proxy entry", 150f),
+            Column("Selected", "bool", "Whether this row matches AgentCrossWorldLinkshell.SelectedCWLSIndex", 92f));
+
+        var visibleRows = new List<ClientStructsSheetRow>();
+        BuildWindow(totalRows, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
+        for (var offset = 0; offset < rowsToLoad; offset++)
+        {
+            var rowIndex = startIndex + offset;
+            var name = proxy->GetCrossworldLinkshellName((uint)rowIndex);
+            var entry = proxy->CrossWorldLinkshells[rowIndex];
+            var isSelected = selectedIndex.HasValue && selectedIndex.Value == rowIndex;
+            visibleRows.Add(CreateRow(
+                rowIndex,
+                (uint)(rowIndex + 1),
+                Cell(rowIndex),
+                Cell(rowIndex + 1),
+                Cell(name == null ? string.Empty : name->ToString(), rowIndex + 1),
+                Cell(FormatCrossWorldLinkshellMembershipType(entry.MembershipType), entry.MembershipType),
+                Cell(FormatUnixTimestamp(entry.FoundationTime), entry.FoundationTime),
+                Cell(isSelected)));
+        }
+
+        var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {totalRows} • NumInvites: {proxy->NumInvites} • SelectedCWLSIndex: {FormatOptionalIndex(selectedIndex)}";
+        return CreateSnapshot(definition, columns, visibleRows, totalRows, startIndex, request.RowCount, $"Pointer: {FormatPointer(proxy)}", message);
     }
 
     private ClientStructsSheetSnapshot ReadItemSearchListings(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
@@ -886,6 +989,39 @@ public sealed unsafe class ClientStructsSheetService
 
     private static string FormatUnixTimestamp(uint value)
         => FormatUnixTimestamp((long)value);
+
+    private static int? GetSelectedLinkshellIndex()
+    {
+        var agentModule = AgentModule.Instance();
+        if (agentModule == null)
+            return null;
+
+        var agent = (AgentLinkshell*)agentModule->GetAgentByInternalId(AgentId.Linkshell);
+        return agent == null ? null : agent->SelectedLSIndex;
+    }
+
+    private static int? GetSelectedCrossWorldLinkshellIndex()
+    {
+        var agentModule = AgentModule.Instance();
+        if (agentModule == null)
+            return null;
+
+        var agent = (AgentCrossWorldLinkshell*)agentModule->GetAgentByInternalId(AgentId.CrossWorldLinkShell);
+        return agent == null ? null : agent->SelectedCWLSIndex;
+    }
+
+    private static string FormatOptionalIndex(int? value)
+        => value.HasValue ? value.Value.ToString(CultureInfo.InvariantCulture) : "<unavailable>";
+
+    private static string FormatCrossWorldLinkshellMembershipType(ushort membershipType)
+        => membershipType switch
+        {
+            0 => "0 — Invitee",
+            1 => "1 — Member",
+            2 => "2 — Leader",
+            3 => "3 — Master",
+            _ => membershipType.ToString(CultureInfo.InvariantCulture)
+        };
 
     private static string FormatRetainerTown(RetainerManager.RetainerTown town)
     {

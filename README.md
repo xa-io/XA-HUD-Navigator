@@ -9,7 +9,7 @@ XA HUD Navigator is a Dalamud plugin for FFXIV that provides a real-time visual 
 - **Logging Workspace** — Optional logging mode to capture addon appear/close timing while you interact with in-game UI
 - **Debug Workspace** — Optional debug tab with recursive component-path dumps, text/event filtering, and selected-branch copy helpers for the currently selected addon
 - **Lumina Sheets Browser** — Optional sheets workspace with common-sheet shortcuts, all-sheet search, schema-aware column headers, a multi-row grid, row jumping, and copy helpers
-- **CS.Sheets Browser** — ClientStructs-backed runtime workspace with curated game, player, quest, inventory, retainer, housing, market, Free Company, action, and target views rendered in the same sheet-style grid workflow
+- **CS.Sheets Browser** — ClientStructs-backed runtime workspace with curated game, player, quest, inventory, retainer, housing, social, market, Free Company, action, and target views rendered in the same sheet-style grid workflow
 - **Interactive Element Detection** — Identifies buttons, checkboxes, sliders, dropdowns, and other interactive component nodes
 - **HUD Overlay** — Transparent fullscreen overlay draws colored outlines around visible addons and highlights interactive nodes in green
 - **Text Node Display** — Shows text content from AtkTextNode elements for reading addon text
@@ -32,7 +32,7 @@ XA HUD Navigator is a Dalamud plugin for FFXIV that provides a real-time visual 
 
 This means that there are still features being implemented and enhanced. Suggestions and feature requests are welcome via github issues or by visiting the discord server for direct support.
 
-## This is VERY EARLY ACCESS and should be used with caution.
+## This is VERY EARLY ACCESS and should be used with caution
 
 This will likely have game crashes caused by reading too much memory directly from the game. When not in use, you should disable the plugin. Use at your own risk.
 
@@ -66,11 +66,11 @@ This will likely have game crashes caused by reading too much memory directly fr
 6. Use **Lumina Sheets** for EXD browsing or **CS.Sheets** for live ClientStructs-backed runtime views
 7. In **Lumina Sheets**, use **Row ID**, **Start Index**, **Rows**, and the paging buttons to jump to row IDs or browse visible row windows
 8. In **Lumina Sheets**, use **Schema Formatting**, **Offsets**, and **Comments** to switch between raw columns and EXDSchema-style field formatting
-9. In **CS.Sheets**, pick a curated runtime view such as `PlayerState`, `Inventory Slots`, `Retainers`, `Housing`, `Item Search Listings`, or `TargetSystem`
+9. In **CS.Sheets**, pick a curated runtime view such as `PlayerState`, `Inventory Slots`, `Retainers`, `Linkshell`, `Cross-world Linkshell`, `Housing`, `Item Search Listings`, or `TargetSystem`
 10. For runtime views that support it, use **InventoryType**, **Start Index**, **Rows**, and the paging buttons to browse live containers and caches in a sheet-style grid
 11. Click any grid cell to inspect the selected row, raw/display values, field details, and copy helpers on the right
 12. Click any addon in the left panel to inspect its node tree and debug dump
-13. Interactive nodes are marked in green — these are buttons, checkboxes, etc. that can be clicked via automation
+13. Interactive nodes are marked in green — these are buttons, checkboxes, etc that can be clicked via automation
 14. Use **Copy All Nodes**, **Copy Full Dump**, **Copy Filtered Dump**, or the sheet/runtime copy helpers to move verified data into your real plugin code later
 
 ## License

@@ -1,11 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Dalamud.NET.Sdk/14.0.2">
   <PropertyGroup>
-    <Version>0.0.0.2</Version>
+    <Version>0.0.0.3</Version>
     <PackageProjectUrl>https://github.com/xa-io</PackageProjectUrl>
     <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
     <IsPackable>false</IsPackable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <PathMap>$(MSBuildProjectDirectory)=/_/XAHudNavigator</PathMap>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="YamlDotNet" Version="15.1.2" />

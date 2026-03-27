@@ -3,7 +3,7 @@
   "Name": "XA HUD Navigator",
   "InternalName": "XAHudNavigator",
   "RepoUrl": "https://github.com/xa-io/XA-HUD-Navigator",
-  "AssemblyVersion": "0.0.0.2",
+  "AssemblyVersion": "0.0.0.3",
   "Punchline": "Finding stuff is hard.",
   "Description": "Finding stuff is hard.",
   "IconUrl": "images/icon.png",
