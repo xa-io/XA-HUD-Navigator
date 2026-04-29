@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 using XAHudNavigator.Services;
 
@@ -15,6 +16,7 @@ namespace XAHudNavigator.Windows;
 public class HudOverlay : Window, IDisposable
 {
     private readonly Plugin plugin;
+    private static float UiScale => ImGuiHelpers.GlobalScale;
 
     private static readonly uint AddonOutlineColor = 0xFF00FFFF;  // cyan
     private static readonly uint InteractiveColor = 0xFF00FF00;   // bright green
@@ -79,17 +81,17 @@ public class HudOverlay : Window, IDisposable
         {
             var addonMin = selectedAddon.Position;
             var addonMax = selectedAddon.Position + selectedAddon.Size;
-            drawList.AddRect(addonMin, addonMax, AddonOutlineColor, 0, ImDrawFlags.None, 2.0f);
+            drawList.AddRect(addonMin, addonMax, AddonOutlineColor, 0, ImDrawFlags.None, Scale(2.0f));
         }
 
         // Draw addon name label
         if (showNames)
         {
-            var labelPos = selectedAddon.Position + new Vector2(2, -16);
+            var labelPos = selectedAddon.Position + ScaledVector(2f, -16f);
             var label = $"{selectedAddon.Name} [{selectedAddon.NodeCount}]";
             var textSize = ImGui.CalcTextSize(label);
-            drawList.AddRectFilled(labelPos, labelPos + textSize + new Vector2(6, 2), LabelBgColor);
-            drawList.AddText(labelPos + new Vector2(3, 0), AddonOutlineColor, label);
+            drawList.AddRectFilled(labelPos, labelPos + textSize + ScaledVector(6f, 2f), LabelBgColor);
+            drawList.AddText(labelPos + ScaledVector(3f, 0f), AddonOutlineColor, label);
         }
 
         // Skip node drawing entirely if boxes and IDs are both off
@@ -115,7 +117,7 @@ public class HudOverlay : Window, IDisposable
             {
                 var pulseByte = (uint)(byte)(255 * pulseAlpha);
                 var pulseColor = 0xFF000000u | (pulseByte << 16) | (pulseByte << 8) | 0xFFu; // pulsating cyan
-                drawList.AddRect(nodeMin, nodeMax, pulseColor, 0, ImDrawFlags.None, 3.0f);
+                drawList.AddRect(nodeMin, nodeMax, pulseColor, 0, ImDrawFlags.None, Scale(3.0f));
                 // Filled highlight with low alpha
                 var fillAlpha = (byte)(60 * pulseAlpha);
                 var fillColor = (uint)((fillAlpha << 24) | 0x00FFFF);
@@ -123,8 +125,8 @@ public class HudOverlay : Window, IDisposable
                 // Always show label for pulsating node
                 var pulseLabel = $"[{node.Index}] {node.TypeDisplay}";
                 var pulseLabelSize = ImGui.CalcTextSize(pulseLabel);
-                drawList.AddRectFilled(nodeMin, nodeMin + pulseLabelSize + new Vector2(4, 2), LabelBgColor);
-                drawList.AddText(nodeMin + new Vector2(2, 0), pulseColor, pulseLabel);
+                drawList.AddRectFilled(nodeMin, nodeMin + pulseLabelSize + ScaledVector(4f, 2f), LabelBgColor);
+                drawList.AddText(nodeMin + ScaledVector(2f, 0f), pulseColor, pulseLabel);
                 continue;
             }
 
@@ -133,17 +135,17 @@ public class HudOverlay : Window, IDisposable
             if (node.IsInteractive)
             {
                 outlineColor = InteractiveColor;
-                thickness = 1.5f;
+                thickness = Scale(1.5f);
             }
             else if (node.Type == FFXIVClientStructs.FFXIV.Component.GUI.NodeType.Text && !string.IsNullOrEmpty(node.Text))
             {
                 outlineColor = TextNodeColor;
-                thickness = 1.0f;
+                thickness = Scale(1.0f);
             }
             else
             {
                 outlineColor = NonInteractiveColor;
-                thickness = 0.5f;
+                thickness = Scale(0.5f);
             }
 
             drawList.AddRect(nodeMin, nodeMax, outlineColor, 0, ImDrawFlags.None, thickness);
@@ -153,8 +155,8 @@ public class HudOverlay : Window, IDisposable
             {
                 var idLabel = $"[{node.Index}] {node.TypeDisplay}";
                 var idSize = ImGui.CalcTextSize(idLabel);
-                drawList.AddRectFilled(nodeMin, nodeMin + idSize + new Vector2(4, 2), LabelBgColor);
-                drawList.AddText(nodeMin + new Vector2(2, 0), outlineColor, idLabel);
+                drawList.AddRectFilled(nodeMin, nodeMin + idSize + ScaledVector(4f, 2f), LabelBgColor);
+                drawList.AddText(nodeMin + ScaledVector(2f, 0f), outlineColor, idLabel);
             }
         }
 
@@ -182,10 +184,10 @@ public class HudOverlay : Window, IDisposable
                 // Highlight the hovered node
                 var hMin = hoveredNode.ScreenPosition;
                 var hMax = hMin + hoveredNode.Size;
-                drawList.AddRect(hMin, hMax, HoverColor, 0, ImDrawFlags.None, 2.5f);
+                drawList.AddRect(hMin, hMax, HoverColor, 0, ImDrawFlags.None, Scale(2.5f));
 
                 // Draw tooltip near mouse
-                var tooltipPos = mousePos + new Vector2(15, 15);
+                var tooltipPos = mousePos + ScaledVector(15f, 15f);
                 var lines = new[]
                 {
                     $"[{hoveredNode.Index}] {hoveredNode.TypeDisplay}",
@@ -206,18 +208,24 @@ public class HudOverlay : Window, IDisposable
                     if (w > maxW) maxW = w;
                 }
 
-                var bgSize = new Vector2(maxW + 10, validLines.Count * lineH + 6);
-                drawList.AddRectFilled(tooltipPos, tooltipPos + bgSize, LabelBgColor, 3);
-                drawList.AddRect(tooltipPos, tooltipPos + bgSize, HoverColor, 3, ImDrawFlags.None, 1);
+                var bgSize = new Vector2(maxW + Scale(10f), validLines.Count * lineH + Scale(6f));
+                drawList.AddRectFilled(tooltipPos, tooltipPos + bgSize, LabelBgColor, Scale(3f));
+                drawList.AddRect(tooltipPos, tooltipPos + bgSize, HoverColor, Scale(3f), ImDrawFlags.None, Scale(1f));
 
-                var y = tooltipPos.Y + 3;
+                var y = tooltipPos.Y + Scale(3f);
                 foreach (var line in validLines)
                 {
                     var color = line == "INTERACTIVE" ? InteractiveColor : 0xFFFFFFFF;
-                    drawList.AddText(new Vector2(tooltipPos.X + 5, y), color, line);
+                    drawList.AddText(new Vector2(tooltipPos.X + Scale(5f), y), color, line);
                     y += lineH;
                 }
             }
         }
     }
+
+    private static float Scale(float value)
+        => value * UiScale;
+
+    private static Vector2 ScaledVector(float x, float y)
+        => ImGuiHelpers.ScaledVector2(x, y);
 }

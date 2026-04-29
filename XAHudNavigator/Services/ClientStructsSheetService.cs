@@ -2,23 +2,53 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using FFXIVClientStructs.FFXIV.Application.Network;
 using FFXIVClientStructs.FFXIV.Application.Network.WorkDefinitions;
+using FFXIVClientStructs.FFXIV.Client.Enums;
+using FFXIVClientStructs.FFXIV.Client.Game.Event;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.Control;
+using FFXIVClientStructs.FFXIV.Client.Game.Fate;
+using FFXIVClientStructs.FFXIV.Client.Game.Group;
+using FFXIVClientStructs.FFXIV.Client.Game.InstanceContent;
+using FFXIVClientStructs.FFXIV.Client.Game.Network;
+using FFXIVClientStructs.FFXIV.Client.Network;
+using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
+using InteropGenerator.Runtime;
 using Lumina.Excel.Sheets;
+using AgentContentsType = FFXIVClientStructs.FFXIV.Client.UI.Agent.ContentsType;
+using ClientTerritoryIntendedUse = FFXIVClientStructs.FFXIV.Client.Enums.TerritoryIntendedUse;
+using EventContentType = FFXIVClientStructs.FFXIV.Client.Game.Event.ContentType;
+using FrameworkSystem = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework;
+using InstanceDynamicEvent = FFXIVClientStructs.FFXIV.Client.Game.InstanceContent.DynamicEvent;
+using LuminaContentRouletteSheet = Lumina.Excel.Sheets.ContentRoulette;
 
 namespace XAHudNavigator.Services;
 
-public sealed unsafe class ClientStructsSheetService
+public sealed unsafe class ClientStructsSheetService : IDisposable
 {
+    private readonly ZoneInstanceSnapshotService zoneInstanceSnapshotService = new();
+
     private static readonly IReadOnlyList<ClientStructsSheetDefinition> SheetDefinitions = new[]
     {
         new ClientStructsSheetDefinition("GameMain", "Game", "Live zone, map, territory, and content state.", "var gm = GameMain.Instance();"),
         new ClientStructsSheetDefinition("PlayerState", "Player", "Current character identity, level, unlock, and weekly state.", "var ps = PlayerState.Instance();"),
-        new ClientStructsSheetDefinition("UIState", "Player", "UI-backed runtime state such as item level and buddy timers.", "var uiState = UIState.Instance();"),
+        new ClientStructsSheetDefinition("UIState", "Player", "UI-backed runtime state such as item level, buddy timers, and public-instance fields.", "var uiState = UIState.Instance();"),
+        new ClientStructsSheetDefinition("Conditions", "State", "Live player condition flags such as combat, duty, travel, and occupancy state.", "var conditions = Conditions.Instance();"),
+        new ClientStructsSheetDefinition("Weather", "World", "Current and upcoming weather state for the active territory.", "var weather = WeatherManager.Instance();"),
+        new ClientStructsSheetDefinition("Public Instance", "Instances", "UIState.PublicInstance fields used for public-instance routing and zone selection.", "var publicInstance = &UIState.Instance()->PublicInstance;"),
+        new ClientStructsSheetDefinition("Network Instance", "Instances", "Framework and NetworkModule instance state for the current zone.", "var proxy = Framework.Instance()->NetworkModuleProxy;"),
+        new ClientStructsSheetDefinition("Zone Init Packet", "Instances", "Last captured raw InitZone packet values, including packet instance and PopRangeId.", "hooked from UIModule.HandlePacket(..., UIModulePacketType.InitZone, packet);"),
+        new ClientStructsSheetDefinition("Contents Finder", "Instances", "Duty Finder queue state, penalties, and queue options from UIState/ContentsFinder.", "var contentsFinder = ContentsFinder.Instance();"),
+        new ClientStructsSheetDefinition("EventFramework", "Instances", "Active content-director pointers and public-content state from EventFramework.", "var eventFramework = EventFramework.Instance();"),
+        new ClientStructsSheetDefinition("Content Director", "Instances", "Detailed active director state for duties and public content, including timers, rewards, and director text.", "var contentDirector = EventFramework.Instance()->GetContentDirector();"),
+        new ClientStructsSheetDefinition("Director Todos", "Instances", "Windowed view of active director objective text rows.", "var todos = EventFramework.Instance()->GetContentDirector()->DirectorTodos;", SupportsWindowing: true),
+        new ClientStructsSheetDefinition("Dynamic Events", "Instances", "Active dynamic-event rows from public-content runtime state.", "var container = DynamicEventContainer.GetInstance();", SupportsWindowing: true),
+        new ClientStructsSheetDefinition("Eureka Status", "Eureka", "Aggregated Eureka runtime state from GameMain, PlayerState, UIState, Inspect, and PublicContentEureka.", "var eurekaDirector = (PublicContentEureka*)EventFramework.GetPublicContentDirectorByType(PublicContentDirectorType.Eureka);"),
+        new ClientStructsSheetDefinition("Bozja Status", "Bozja", "Aggregated Bozja runtime state from PublicContentBozja and its dynamic-event container.", "var bozja = PublicContentBozja.GetInstance();"),
         new ClientStructsSheetDefinition("Quest Summary", "Quests", "QuestManager summary counts and timers.", "var qm = QuestManager.Instance();"),
         new ClientStructsSheetDefinition("Active Quests", "Quests", "Accepted normal quests from QuestManager.NormalQuests.", "var quests = QuestManager.Instance()->NormalQuests;", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Daily Quests", "Quests", "Accepted daily quests from QuestManager.DailyQuests.", "var dailies = QuestManager.Instance()->DailyQuests;", SupportsWindowing: true),
@@ -27,6 +57,9 @@ public sealed unsafe class ClientStructsSheetService
         new ClientStructsSheetDefinition("Inventory Slots", "Inventory", "Windowed browse of a selected InventoryType container.", "var container = InventoryManager.Instance()->GetInventoryContainer(InventoryType.Inventory1);", SupportsWindowing: true, SupportsInventoryType: true),
         new ClientStructsSheetDefinition("Retainers", "Retainers", "Retainer roster and venture summary data from RetainerManager.", "var rm = RetainerManager.Instance();", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Housing", "Housing", "Current and owned-house state from HousingManager.", "var hm = HousingManager.Instance();"),
+        new ClientStructsSheetDefinition("Agent Map", "Map/UI", "Current map-agent selection, marker counts, map paths, and open-map context.", "var agentMap = (AgentMap*)AgentModule.Instance()->GetAgentByInternalId(AgentId.Map);"),
+        new ClientStructsSheetDefinition("Map Markers", "Map/UI", "Windowed active map-marker rows from AgentMap.", "var markers = ((AgentMap*)AgentModule.Instance()->GetAgentByInternalId(AgentId.Map))->MapMarkers;", SupportsWindowing: true),
+        new ClientStructsSheetDefinition("Event Markers", "Map/UI", "Windowed event-marker rows built by FateManager, EventFramework, and map runtime.", "var eventMarkers = ((AgentMap*)AgentModule.Instance()->GetAgentByInternalId(AgentId.Map))->EventMarkers;", SupportsWindowing: true),
         new ClientStructsSheetDefinition("InfoModule", "Social/UI", "InfoModule and InfoProxy availability state.", "var infoModule = InfoModule.Instance();"),
         new ClientStructsSheetDefinition("Linkshell", "Social/UI", "Normal Linkshell slots from InfoProxyLinkshell.", "var linkshell = (InfoProxyLinkshell*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.Linkshell);", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Cross-world Linkshell", "Social/UI", "Cross-world Linkshell slots from InfoProxyCrossWorldLinkshell.", "var cwls = (InfoProxyCrossWorldLinkshell*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.CrossWorldLinkshell);", SupportsWindowing: true),
@@ -34,11 +67,16 @@ public sealed unsafe class ClientStructsSheetService
         new ClientStructsSheetDefinition("Retainer Listings", "Market", "Last targeted retainer listings cached in InfoProxyItemSearch.", "var itemSearch = (InfoProxyItemSearch*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.ItemSearch);", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Player Retainers", "Market", "Player retainer market cache from InfoProxyItemSearch.", "var itemSearch = (InfoProxyItemSearch*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.ItemSearch);", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Free Company", "Social/UI", "Free Company summary state from InfoProxyFreeCompany.", "var freeCompany = (InfoProxyFreeCompany*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.FreeCompany);"),
+        new ClientStructsSheetDefinition("FATE Summary", "World", "Current FATE manager summary, including synced/current FATE and joined state.", "var fateManager = FateManager.Instance();"),
+        new ClientStructsSheetDefinition("Active FATEs", "World", "Windowed active FATE contexts from FateManager.", "var fates = FateManager.Instance()->Fates;", SupportsWindowing: true),
+        new ClientStructsSheetDefinition("Party Members", "Social/UI", "Live party/alliance member runtime data from GroupManager.", "var group = GroupManager.Instance()->GetGroup();", SupportsWindowing: true),
         new ClientStructsSheetDefinition("ActionManager", "Automation", "Current cast, queue, and targeting state from ActionManager.", "var am = ActionManager.Instance();"),
         new ClientStructsSheetDefinition("TargetSystem", "Automation", "Current hard/soft/focus target state from TargetSystem.", "var ts = TargetSystem.Instance();")
     };
 
     public IReadOnlyList<ClientStructsSheetDefinition> Definitions => SheetDefinitions;
+
+    public void Dispose() => zoneInstanceSnapshotService.Dispose();
 
     public ClientStructsSheetDefinition? GetDefinition(string? name)
         => string.IsNullOrWhiteSpace(name)
@@ -56,6 +94,18 @@ public sealed unsafe class ClientStructsSheetService
             "GameMain" => ReadGameMain(definition),
             "PlayerState" => ReadPlayerState(definition),
             "UIState" => ReadUIState(definition),
+            "Conditions" => ReadConditions(definition),
+            "Weather" => ReadWeather(definition),
+            "Public Instance" => ReadPublicInstance(definition),
+            "Network Instance" => ReadNetworkInstance(definition),
+            "Zone Init Packet" => ReadZoneInitPacket(definition),
+            "Contents Finder" => ReadContentsFinder(definition),
+            "EventFramework" => ReadEventFramework(definition),
+            "Content Director" => ReadContentDirector(definition),
+            "Director Todos" => ReadDirectorTodos(definition, request),
+            "Dynamic Events" => ReadDynamicEvents(definition, request),
+            "Eureka Status" => ReadEurekaStatus(definition),
+            "Bozja Status" => ReadBozjaStatus(definition),
             "Quest Summary" => ReadQuestSummary(definition),
             "Active Quests" => ReadActiveQuests(definition, request),
             "Daily Quests" => ReadDailyQuests(definition, request),
@@ -64,6 +114,9 @@ public sealed unsafe class ClientStructsSheetService
             "Inventory Slots" => ReadInventorySlots(definition, request),
             "Retainers" => ReadRetainers(definition, request),
             "Housing" => ReadHousing(definition),
+            "Agent Map" => ReadAgentMap(definition),
+            "Map Markers" => ReadMapMarkers(definition, request),
+            "Event Markers" => ReadEventMarkers(definition, request),
             "InfoModule" => ReadInfoModule(definition),
             "Linkshell" => ReadLinkshell(definition, request),
             "Cross-world Linkshell" => ReadCrossWorldLinkshell(definition, request),
@@ -71,10 +124,134 @@ public sealed unsafe class ClientStructsSheetService
             "Retainer Listings" => ReadRetainerListings(definition, request),
             "Player Retainers" => ReadPlayerRetainers(definition, request),
             "Free Company" => ReadFreeCompany(definition),
+            "FATE Summary" => ReadFateSummary(definition),
+            "Active FATEs" => ReadActiveFates(definition, request),
+            "Party Members" => ReadPartyMembers(definition, request),
             "ActionManager" => ReadActionManager(definition),
             "TargetSystem" => ReadTargetSystem(definition),
             _ => CreateEmptySnapshot(definition, $"{definition.Name} is not implemented.")
         };
+    }
+
+    public List<ClientStructsSearchResult> SearchAllSheets(string filter, ClientStructsSheetRequest request, int maxResults = 300)
+    {
+        var trimmedFilter = filter?.Trim() ?? string.Empty;
+        if (trimmedFilter.Length < 3)
+            return new List<ClientStructsSearchResult>();
+
+        var results = new List<ClientStructsSearchResult>();
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+        var rowCount = Math.Clamp(request.RowCount <= 0 ? 100 : request.RowCount, 5, 100);
+
+        foreach (var definition in SheetDefinitions)
+        {
+            AddDefinitionSearchMatches(definition, trimmedFilter, results, seenKeys, maxResults);
+            if (results.Count >= maxResults)
+                break;
+
+            var startIndex = 0;
+            while (true)
+            {
+                var snapshot = ReadSheet(definition.Name, new ClientStructsSheetRequest
+                {
+                    StartIndex = startIndex,
+                    RowCount = definition.SupportsWindowing ? 100 : rowCount,
+                    InventoryType = request.InventoryType
+                });
+
+                AddSnapshotSearchMatches(snapshot, trimmedFilter, results, seenKeys, maxResults);
+                if (results.Count >= maxResults || !definition.SupportsWindowing)
+                    break;
+
+                if (snapshot.Rows.Count == 0)
+                    break;
+
+                var nextStartIndex = snapshot.StartIndex + snapshot.Rows.Count;
+                if (nextStartIndex >= snapshot.TotalRowCount)
+                    break;
+
+                startIndex = nextStartIndex;
+            }
+
+            if (results.Count >= maxResults)
+                break;
+        }
+
+        return results;
+    }
+
+    private static void AddDefinitionSearchMatches(ClientStructsSheetDefinition definition, string filter, List<ClientStructsSearchResult> results, HashSet<string> seenKeys, int maxResults)
+    {
+        AddSearchResultIfMatch(definition.Name, filter, definition, results, seenKeys, maxResults, "Sheet Name", definition.Name, definition.Description);
+        AddSearchResultIfMatch(definition.Category, filter, definition, results, seenKeys, maxResults, "Category", definition.Category, definition.Description);
+        AddSearchResultIfMatch(definition.Description, filter, definition, results, seenKeys, maxResults, "Description", definition.Description, definition.AccessSnippet);
+        AddSearchResultIfMatch(definition.AccessSnippet, filter, definition, results, seenKeys, maxResults, "Access Snippet", definition.AccessSnippet, definition.Description);
+    }
+
+    private static void AddSnapshotSearchMatches(ClientStructsSheetSnapshot snapshot, string filter, List<ClientStructsSearchResult> results, HashSet<string> seenKeys, int maxResults)
+    {
+        AddSearchResultIfMatch(snapshot.Status, filter, snapshot.Definition, results, seenKeys, maxResults, "Status", snapshot.Status, snapshot.Message);
+        AddSearchResultIfMatch(snapshot.Message, filter, snapshot.Definition, results, seenKeys, maxResults, "Message", snapshot.Message, snapshot.Status);
+
+        for (var columnIndex = 0; columnIndex < snapshot.Columns.Count && results.Count < maxResults; columnIndex++)
+        {
+            var column = snapshot.Columns[columnIndex];
+            AddSearchResultIfMatch(column.Header, filter, snapshot.Definition, results, seenKeys, maxResults, "Column Header", column.Header, column.Tooltip, columnIndex: column.ColumnIndex, columnHeader: column.Header);
+            AddSearchResultIfMatch(column.Descriptor, filter, snapshot.Definition, results, seenKeys, maxResults, "Column Descriptor", column.Descriptor, column.Tooltip, columnIndex: column.ColumnIndex, columnHeader: column.Header);
+            AddSearchResultIfMatch(column.Tooltip, filter, snapshot.Definition, results, seenKeys, maxResults, "Column Tooltip", column.Tooltip, column.Descriptor, columnIndex: column.ColumnIndex, columnHeader: column.Header);
+        }
+
+        for (var rowIndex = 0; rowIndex < snapshot.Rows.Count && results.Count < maxResults; rowIndex++)
+        {
+            var row = snapshot.Rows[rowIndex];
+            AddSearchResultIfMatch(row.RowIndex.ToString(CultureInfo.InvariantCulture), filter, snapshot.Definition, results, seenKeys, maxResults, "Row Index", row.RowIndex.ToString(CultureInfo.InvariantCulture), $"Row ID {row.RowId}", row.RowIndex, row.RowId);
+            AddSearchResultIfMatch(row.RowId.ToString(CultureInfo.InvariantCulture), filter, snapshot.Definition, results, seenKeys, maxResults, "Row ID", row.RowId.ToString(CultureInfo.InvariantCulture), $"Row Index {row.RowIndex}", row.RowIndex, row.RowId);
+
+            for (var cellIndex = 0; cellIndex < row.Cells.Count && cellIndex < snapshot.Columns.Count && results.Count < maxResults; cellIndex++)
+            {
+                var cell = row.Cells[cellIndex];
+                var column = snapshot.Columns[cellIndex];
+                AddSearchResultIfMatch(cell.DisplayText, filter, snapshot.Definition, results, seenKeys, maxResults, "Display Value", cell.DisplayText, cell.RawText, row.RowIndex, row.RowId, column.ColumnIndex, column.Header);
+                AddSearchResultIfMatch(cell.RawText, filter, snapshot.Definition, results, seenKeys, maxResults, "Raw Value", cell.RawText, cell.DisplayText, row.RowIndex, row.RowId, column.ColumnIndex, column.Header);
+            }
+        }
+    }
+
+    private static void AddSearchResultIfMatch(
+        string? source,
+        string filter,
+        ClientStructsSheetDefinition definition,
+        List<ClientStructsSearchResult> results,
+        HashSet<string> seenKeys,
+        int maxResults,
+        string matchSource,
+        string displayText,
+        string detailText,
+        int rowIndex = -1,
+        uint rowId = 0,
+        int columnIndex = -1,
+        string columnHeader = "")
+    {
+        if (results.Count >= maxResults || string.IsNullOrWhiteSpace(source) || !source.Contains(filter, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var result = new ClientStructsSearchResult
+        {
+            SheetName = definition.Name,
+            Category = definition.Category,
+            RowIndex = rowIndex,
+            RowId = rowId,
+            ColumnIndex = columnIndex,
+            ColumnHeader = columnHeader,
+            MatchSource = matchSource,
+            DisplayText = displayText ?? string.Empty,
+            RawText = source ?? string.Empty,
+            DetailText = detailText ?? string.Empty
+        };
+
+        var key = $"{result.SheetName}|{result.MatchSource}|{result.RowIndex}|{result.RowId}|{result.ColumnIndex}|{result.ColumnHeader}|{result.RawText}";
+        if (seenKeys.Add(key))
+            results.Add(result);
     }
 
     private ClientStructsSheetSnapshot ReadGameMain(ClientStructsSheetDefinition definition)
@@ -93,10 +270,16 @@ public sealed unsafe class ClientStructsSheetService
                 SummaryRow("ConnectedToZone", gameMain->ConnectedToZone, gameMain->ConnectedToZone, "True when the client is connected to the active zone"),
                 SummaryRow("TerritoryLoadState", gameMain->TerritoryLoadState, gameMain->TerritoryLoadState, "1 = loading, 2 = loaded, 3 = unloading"),
                 SummaryRow("CurrentTerritoryTypeId", gameMain->CurrentTerritoryTypeId, gameMain->CurrentTerritoryTypeId, "Current territory type row id"),
+                SummaryRow("CurrentTerritory", ResolveTerritoryName(gameMain->CurrentTerritoryTypeId), gameMain->CurrentTerritoryTypeId, "Current territory resolved through Lumina when available"),
                 SummaryRow("NextTerritoryTypeId", gameMain->NextTerritoryTypeId, gameMain->NextTerritoryTypeId, "Incoming territory type row id"),
+                SummaryRow("NextTerritory", ResolveTerritoryName(gameMain->NextTerritoryTypeId), gameMain->NextTerritoryTypeId, "Incoming territory resolved through Lumina when available"),
                 SummaryRow("CurrentMapId", gameMain->CurrentMapId, gameMain->CurrentMapId, "Current map row id"),
+                SummaryRow("CurrentTerritoryFilterKey", gameMain->CurrentTerritoryFilterKey, gameMain->CurrentTerritoryFilterKey, "Current territory filter key used by map/layout runtime"),
+                SummaryRow("TransitionTerritoryFilterKey", gameMain->TransitionTerritoryFilterKey, gameMain->TransitionTerritoryFilterKey, "Transition territory filter key used while entering the current area"),
                 SummaryRow("CurrentContentFinderConditionId", gameMain->CurrentContentFinderConditionId, gameMain->CurrentContentFinderConditionId, "Current duty/content finder row id"),
-                SummaryRow("CurrentTerritoryIntendedUseId", gameMain->CurrentTerritoryIntendedUseId.ToString(), (uint)gameMain->CurrentTerritoryIntendedUseId, "Live intended-use enum"),
+                SummaryRow("CurrentContentFinderCondition", ResolveContentFinderConditionName(gameMain->CurrentContentFinderConditionId), gameMain->CurrentContentFinderConditionId, "Current duty/content finder resolved through Lumina when available"),
+                SummaryRow("CurrentTerritoryIntendedUseId", FormatTerritoryIntendedUse(gameMain->CurrentTerritoryIntendedUseId), (byte)gameMain->CurrentTerritoryIntendedUseId, "Live intended-use enum"),
+                SummaryRow("IsEurekaTerritory", gameMain->CurrentTerritoryIntendedUseId == ClientTerritoryIntendedUse.Eureka, gameMain->CurrentTerritoryIntendedUseId == ClientTerritoryIntendedUse.Eureka, "True when the territory intended use is Eureka"),
                 SummaryRow("RuntimeSeconds", gameMain->RuntimeSeconds, gameMain->RuntimeSeconds, "Seconds since runtime counter start"),
                 SummaryRow("TerritoryTransitionDelay", gameMain->TerritoryTransitionDelay.ToString("F2", CultureInfo.InvariantCulture), gameMain->TerritoryTransitionDelay, "Transition delay in seconds"),
                 SummaryRow("IsInInstanceArea()", gameMain->IsInInstanceArea(), gameMain->IsInInstanceArea(), "Instance-area helper result"),
@@ -136,6 +319,9 @@ public sealed unsafe class ClientStructsSheetService
                 SummaryRow("HasPremiumSaddlebag", playerState->HasPremiumSaddlebag, playerState->HasPremiumSaddlebag, "Premium saddlebag entitlement"),
                 SummaryRow("NumOwnedMounts", playerState->NumOwnedMounts, playerState->NumOwnedMounts, "Count of unlocked mounts"),
                 SummaryRow("CanFly", playerState->CanFly, playerState->CanFly, "Live flying unlock for current zone"),
+                SummaryRow("GetContentValue(2)", playerState->GetContentValue(2), playerState->GetContentValue(2), "Eureka effective elemental level when relevant content is loaded"),
+                SummaryRow("GetContentValue(3)", playerState->GetContentValue(3), playerState->GetContentValue(3), "Eureka elemental sync flag when relevant content is loaded"),
+                SummaryRow("GetContentValue(4)", playerState->GetContentValue(4), playerState->GetContentValue(4), "Eureka current elemental level when relevant content is loaded"),
                 SummaryRow("HasWeeklyBingoJournal", playerState->HasWeeklyBingoJournal, playerState->HasWeeklyBingoJournal, "Whether the Wondrous Tails journal is currently held"),
                 SummaryRow("WeeklyBingoNumSecondChancePoints", playerState->WeeklyBingoNumSecondChancePoints, playerState->WeeklyBingoNumSecondChancePoints, "Second chance points from Wondrous Tails"),
                 SummaryRow("WeeklyBingoExpire", FormatUnixTimestamp(playerState->GetWeeklyBingoExpireUnixTimestamp()), playerState->GetWeeklyBingoExpireUnixTimestamp(), "Wondrous Tails expiration timestamp"),
@@ -165,7 +351,699 @@ public sealed unsafe class ClientStructsSheetService
                 SummaryRow("UnlockedTripleTriadCardsCount", uiState->UnlockedTripleTriadCardsCount, uiState->UnlockedTripleTriadCardsCount, "Total unlocked Triple Triad cards count"),
                 SummaryRow("UnlockedCompanionsCount", uiState->UnlockedCompanionsCount, uiState->UnlockedCompanionsCount, "Total unlocked companion count"),
                 SummaryRow("TerritoryTypeTransientRowLoaded", uiState->TerritoryTypeTransientRowLoaded, uiState->TerritoryTypeTransientRowLoaded, "Whether the transient territory row is loaded"),
+                SummaryRow("PublicInstance.AddonId", uiState->PublicInstance.AddonId, uiState->PublicInstance.AddonId, "SelectString addon id used for public-instance selection"),
+                SummaryRow("PublicInstance.CloseCountdown", uiState->PublicInstance.CloseCountdown.ToString("F1", CultureInfo.InvariantCulture), uiState->PublicInstance.CloseCountdown, "Countdown while the public-instance selection window is open"),
+                SummaryRow("PublicInstance.TerritoryTypeId", ResolveTerritoryName(uiState->PublicInstance.TerritoryTypeId), uiState->PublicInstance.TerritoryTypeId, "Territory attached to the current public-instance selection state"),
+                SummaryRow("PublicInstance.InstanceId", uiState->PublicInstance.InstanceId, uiState->PublicInstance.InstanceId, "Current public-instance id exposed by UIState"),
+                SummaryRow("PublicInstance.IsInstancedArea()", uiState->PublicInstance.IsInstancedArea(), uiState->PublicInstance.IsInstancedArea(), "True when UIState believes the current area is publicly instanced"),
                 SummaryRow("GMRank", uiState->GMRank, uiState->GMRank, "GM rank / debug state byte")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadConditions(ClientStructsSheetDefinition definition)
+    {
+        var conditions = Conditions.Instance();
+        if (conditions == null)
+            return CreateEmptySnapshot(definition, "Conditions.Instance() returned null.");
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Pointer: {FormatPointer(conditions)}",
+            "Live player-condition snapshot.",
+            new[]
+            {
+                SummaryRow("Pointer", FormatPointer(conditions), ((nint)conditions).ToString("X", CultureInfo.InvariantCulture), "Conditions singleton address"),
+                SummaryRow("Normal", conditions->Normal, conditions->Normal, "True during normal free-movement state"),
+                SummaryRow("Occupied", conditions->Occupied, conditions->Occupied, "Generic occupied-state flag"),
+                SummaryRow("InCombat", conditions->InCombat, conditions->InCombat, "Combat state"),
+                SummaryRow("Casting", conditions->Casting, conditions->Casting, "Castbar / casting state"),
+                SummaryRow("Mounted", conditions->Mounted, conditions->Mounted, "Mounted state"),
+                SummaryRow("Mounting", conditions->Mounting, conditions->Mounting, "Mount animation transition"),
+                SummaryRow("Crafting", conditions->Crafting, conditions->Crafting, "Crafting mode state"),
+                SummaryRow("Gathering", conditions->Gathering, conditions->Gathering, "Gathering mode state"),
+                SummaryRow("Fishing", conditions->Fishing, conditions->Fishing, "Fishing state"),
+                SummaryRow("BoundByDuty", conditions->BoundByDuty || conditions->BoundByDuty56 || conditions->BoundByDuty95, conditions->BoundByDuty || conditions->BoundByDuty56 || conditions->BoundByDuty95, "Any duty-bind style flag observed on Conditions"),
+                SummaryRow("BetweenAreas", conditions->BetweenAreas || conditions->BetweenAreas51, conditions->BetweenAreas || conditions->BetweenAreas51, "Zone transition state"),
+                SummaryRow("WatchingCutscene", conditions->WatchingCutscene || conditions->WatchingCutscene78, conditions->WatchingCutscene || conditions->WatchingCutscene78, "Any cutscene-watching flag"),
+                SummaryRow("WaitingForDutyFinder", conditions->WaitingForDutyFinder, conditions->WaitingForDutyFinder, "Queued / waiting for duty finder"),
+                SummaryRow("InDutyQueue", conditions->InDutyQueue, conditions->InDutyQueue, "Duty queue state"),
+                SummaryRow("InFlight", conditions->InFlight, conditions->InFlight, "Flying state"),
+                SummaryRow("Swimming", conditions->Swimming, conditions->Swimming, "Swimming state"),
+                SummaryRow("Diving", conditions->Diving, conditions->Diving, "Diving state"),
+                SummaryRow("UsingHousingFunctions", conditions->UsingHousingFunctions, conditions->UsingHousingFunctions, "Housing interaction state"),
+                SummaryRow("ParticipatingInCrossWorldPartyOrAlliance", conditions->ParticipatingInCrossWorldPartyOrAlliance, conditions->ParticipatingInCrossWorldPartyOrAlliance, "Cross-world party/alliance state"),
+                SummaryRow("InDeepDungeon", conditions->InDeepDungeon, conditions->InDeepDungeon, "Deep Dungeon state"),
+                SummaryRow("PilotingMech", conditions->PilotingMech, conditions->PilotingMech, "Cosmic Exploration mech state"),
+                SummaryRow("MountOrOrnamentTransitionResetTimer", conditions->MountOrOrnamentTransitionResetTimer.ToString("F2", CultureInfo.InvariantCulture), conditions->MountOrOrnamentTransitionResetTimer, "Timer that clears the mount/ornament transition flag")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadWeather(ClientStructsSheetDefinition definition)
+    {
+        var weatherManager = WeatherManager.Instance();
+        if (weatherManager == null)
+            return CreateEmptySnapshot(definition, "WeatherManager.Instance() returned null.");
+
+        var gameMain = GameMain.Instance();
+        var territoryId = (ushort)(gameMain == null ? 0 : gameMain->CurrentTerritoryTypeId);
+        var currentWeather = weatherManager->GetCurrentWeather();
+        var nextWeather = territoryId == 0 ? (byte)0 : weatherManager->GetWeatherForDaytime(territoryId, 1);
+        var afterNextWeather = territoryId == 0 ? (byte)0 : weatherManager->GetWeatherForDaytime(territoryId, 2);
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Pointer: {FormatPointer(weatherManager)}",
+            "WeatherManager snapshot for current and upcoming territory weather.",
+            new[]
+            {
+                SummaryRow("Pointer", FormatPointer(weatherManager), ((nint)weatherManager).ToString("X", CultureInfo.InvariantCulture), "WeatherManager singleton address"),
+                SummaryRow("CurrentTerritory", territoryId == 0 ? "0" : ResolveTerritoryName(territoryId), territoryId, "Territory used for the weather lookup"),
+                SummaryRow("WeatherIndex", weatherManager->WeatherIndex, weatherManager->WeatherIndex, "Current weather slot index"),
+                SummaryRow("WeatherId", ResolveWeatherName(weatherManager->WeatherId), weatherManager->WeatherId, "Current weather id field"),
+                SummaryRow("GetCurrentWeather()", ResolveWeatherName(currentWeather), currentWeather, "Resolved current weather helper"),
+                SummaryRow("WeatherOverride", ResolveWeatherName(weatherManager->WeatherOverride), weatherManager->WeatherOverride, "Weather override id when active"),
+                SummaryRow("IndividualWeatherId", ResolveWeatherName(weatherManager->IndividualWeatherId), weatherManager->IndividualWeatherId, "Individual weather id for territories that support it"),
+                SummaryRow("CurrentDaytimeOffset", weatherManager->CurrentDaytimeOffset, weatherManager->CurrentDaytimeOffset, "0-2 daytime block inside the 24h weather cycle"),
+                SummaryRow("HasIndividualWeather", territoryId != 0 && weatherManager->HasIndividualWeather(territoryId), territoryId != 0 && weatherManager->HasIndividualWeather(territoryId), "Whether the active territory uses individual weather"),
+                SummaryRow("GetWeatherForDaytime(+1)", territoryId == 0 ? "0" : ResolveWeatherName(nextWeather), nextWeather, "Weather expected after the next weather change"),
+                SummaryRow("GetWeatherForDaytime(+2)", territoryId == 0 ? "0" : ResolveWeatherName(afterNextWeather), afterNextWeather, "Weather expected two blocks ahead"),
+                SummaryRow("ServerWeather.Current", ResolveWeatherName(weatherManager->Weathers[weatherManager->WeatherIndex].CurrentWeatherId), weatherManager->Weathers[weatherManager->WeatherIndex].CurrentWeatherId, "Current weather from the backing server-weather slot"),
+                SummaryRow("ServerWeather.Next", ResolveWeatherName(weatherManager->Weathers[weatherManager->WeatherIndex].NextWeatherId), weatherManager->Weathers[weatherManager->WeatherIndex].NextWeatherId, "Next weather from the backing server-weather slot"),
+                SummaryRow("DaytimeFadeTimeLeft", weatherManager->Weathers[weatherManager->WeatherIndex].DaytimeFadeTimeLeft.ToString("F2", CultureInfo.InvariantCulture), weatherManager->Weathers[weatherManager->WeatherIndex].DaytimeFadeTimeLeft, "Fade time remaining in the active server-weather slot"),
+                SummaryRow("DaytimeFadeLength", weatherManager->Weathers[weatherManager->WeatherIndex].DaytimeFadeLength.ToString("F2", CultureInfo.InvariantCulture), weatherManager->Weathers[weatherManager->WeatherIndex].DaytimeFadeLength, "Fade duration in the active server-weather slot")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadPublicInstance(ClientStructsSheetDefinition definition)
+    {
+        var uiState = UIState.Instance();
+        if (uiState == null)
+            return CreateEmptySnapshot(definition, "UIState.Instance() returned null.");
+
+        var publicInstance = &uiState->PublicInstance;
+        var framework = FrameworkSystem.Instance();
+        var proxy = framework == null ? null : framework->NetworkModuleProxy;
+        var networkModule = proxy == null ? null : proxy->NetworkModule;
+        var proxyCurrentInstance = proxy == null ? (short)0 : proxy->GetCurrentInstance();
+        var networkCurrentInstance = networkModule == null ? (short)0 : networkModule->CurrentInstance;
+        var gameMain = GameMain.Instance();
+        var zoneInit = zoneInstanceSnapshotService.GetSnapshot();
+        var replayManager = ContentsReplayManager.Instance();
+        var hasReplayZoneInit = replayManager != null && replayManager->ZoneInitPacket.TerritoryTypeId != 0;
+        var agentMap = TryGetAgentMap();
+        var eventFramework = EventFramework.Instance();
+        var publicContentDirector = eventFramework == null ? null : eventFramework->GetPublicContentDirector();
+        var preferredInstanceCandidate = ResolvePreferredInstanceCandidate(
+            publicInstance->InstanceId,
+            proxyCurrentInstance,
+            networkCurrentInstance,
+            Plugin.ClientState.Instance,
+            zoneInit,
+            replayManager,
+            hasReplayZoneInit,
+            out var preferredInstanceSource);
+        var preferredServerIdCandidate = ResolvePreferredServerIdCandidate(zoneInit, replayManager, hasReplayZoneInit, out var preferredServerIdSource);
+        var preferredPopRangeCandidate = ResolvePreferredPopRangeCandidate(zoneInit, replayManager, hasReplayZoneInit, publicContentDirector, out var preferredPopRangeSource);
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Pointer: {FormatPointer(publicInstance)}",
+            "Live UIState.PublicInstance snapshot.",
+            new[]
+            {
+                SummaryRow("Pointer", FormatPointer(publicInstance), ((nint)publicInstance).ToString("X", CultureInfo.InvariantCulture), "PublicInstance address inside UIState"),
+                SummaryRow("AddonId", publicInstance->AddonId, publicInstance->AddonId, "SelectString addon id that owns the current public-instance prompt"),
+                SummaryRow("CloseCountdown", publicInstance->CloseCountdown.ToString("F1", CultureInfo.InvariantCulture), publicInstance->CloseCountdown, "Countdown while the public-instance selection window is open"),
+                SummaryRow("TerritoryTypeId", ResolveTerritoryName(publicInstance->TerritoryTypeId), publicInstance->TerritoryTypeId, "Territory associated with the current public-instance state"),
+                SummaryRow("InstanceId", publicInstance->InstanceId, publicInstance->InstanceId, "Public-instance id currently exposed by UIState"),
+                SummaryRow("PreferredInstanceCandidate", preferredInstanceCandidate == 0 ? "<none>" : preferredInstanceCandidate, preferredInstanceCandidate, "First non-zero candidate from UIState.PublicInstance.InstanceId -> NetworkModuleProxy.GetCurrentInstance() -> NetworkModule.CurrentInstance -> Dalamud.ClientState.Instance -> LastZoneInit.PacketInstance -> ReplayZoneInit.Instance"),
+                SummaryRow("PreferredInstanceSource", preferredInstanceSource, preferredInstanceSource, "Source currently supplying PreferredInstanceCandidate"),
+                SummaryRow("PreferredServerIdCandidate", preferredServerIdCandidate == 0 ? "<none>" : preferredServerIdCandidate, preferredServerIdCandidate, "First non-zero server-id candidate from LastZoneInit.ServerId -> ReplayZoneInit.ServerId"),
+                SummaryRow("PreferredServerIdSource", preferredServerIdSource, preferredServerIdSource, "Source currently supplying PreferredServerIdCandidate"),
+                SummaryRow("PreferredPopRangeCandidate", preferredPopRangeCandidate == 0 ? "<none>" : preferredPopRangeCandidate, preferredPopRangeCandidate, "First non-zero layout/pop-range candidate from LastZoneInit.PopRangeId -> ReplayZoneInit.PopRangeId -> PublicContent.LGBPopRange"),
+                SummaryRow("PreferredPopRangeSource", preferredPopRangeSource, preferredPopRangeSource, "Source currently supplying PreferredPopRangeCandidate"),
+                SummaryRow("NetworkModuleProxy.GetCurrentInstance()", proxyCurrentInstance, proxyCurrentInstance, "Current instance returned by NetworkModuleProxy"),
+                SummaryRow("NetworkModule.CurrentInstance", networkCurrentInstance, networkCurrentInstance, "Backing short field stored in NetworkModule"),
+                SummaryRow("Dalamud.ClientState.Instance", Plugin.ClientState.Instance, Plugin.ClientState.Instance, "Dalamud client-state instance maintained from NetworkModuleProxy.SetCurrentInstance"),
+                SummaryRow("LastZoneInit.ServerId", zoneInit.HasCapturedPacket ? zoneInit.ServerId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.ServerId : 0, "Server id from the last captured InitZone packet; old EurekaHelper-style shard research should compare this against instance and pop-range data"),
+                SummaryRow("LastZoneInit.PacketInstance", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : 0, "Packet `Instance` from the last captured InitZone packet"),
+                SummaryRow("LastZoneInit.PopRangeId", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : 0, "Packet `PopRangeId` from the last captured InitZone packet; ClientStructs notes this as the PlanMap instance id"),
+                SummaryRow("ReplayZoneInit.ServerId", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : 0, "Server id from the ZoneInitPacket cached on ContentsReplayManager"),
+                SummaryRow("ReplayZoneInit.Instance", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : 0, "ZoneInitPacket.Instance cached on ContentsReplayManager; useful when HUD Navigator loaded after zone-in"),
+                SummaryRow("ReplayZoneInit.PopRangeId", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : 0, "ZoneInitPacket.PopRangeId cached on ContentsReplayManager"),
+                SummaryRow("GameMain.CurrentTerritoryFilterKey", gameMain == null ? 0 : gameMain->CurrentTerritoryFilterKey, gameMain == null ? 0 : gameMain->CurrentTerritoryFilterKey, "Current territory filter key from GameMain"),
+                SummaryRow("GameMain.TransitionTerritoryFilterKey", gameMain == null ? 0 : gameMain->TransitionTerritoryFilterKey, gameMain == null ? 0 : gameMain->TransitionTerritoryFilterKey, "Transition territory filter key from GameMain"),
+                SummaryRow("AgentMap.CurrentMapMarkerRange", agentMap == null ? 0 : agentMap->CurrentMapMarkerRange, agentMap == null ? 0 : agentMap->CurrentMapMarkerRange, "Current map marker range from AgentMap"),
+                SummaryRow("AgentMap.SelectedMapMarkerRange", agentMap == null ? 0 : agentMap->SelectedMapMarkerRange, agentMap == null ? 0 : agentMap->SelectedMapMarkerRange, "Selected map marker range from AgentMap"),
+                SummaryRow("PublicContent.LGBPopRange", publicContentDirector == null ? 0 : publicContentDirector->LGBPopRange, publicContentDirector == null ? 0 : publicContentDirector->LGBPopRange, "Active public-content pop-range field"),
+                SummaryRow("IsInstancedArea()", publicInstance->IsInstancedArea(), publicInstance->IsInstancedArea(), "True when PublicInstance.InstanceId is non-zero"),
+                SummaryRow("MatchesGameMainTerritory", gameMain != null && publicInstance->TerritoryTypeId == gameMain->CurrentTerritoryTypeId, gameMain != null && publicInstance->TerritoryTypeId == gameMain->CurrentTerritoryTypeId, "Whether PublicInstance.TerritoryTypeId matches GameMain.CurrentTerritoryTypeId")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadNetworkInstance(ClientStructsSheetDefinition definition)
+    {
+        var framework = FrameworkSystem.Instance();
+        if (framework == null)
+            return CreateEmptySnapshot(definition, "Framework.Instance() returned null.");
+
+        var proxy = framework->NetworkModuleProxy;
+        var networkModule = proxy == null ? null : proxy->NetworkModule;
+        var proxyCurrentInstance = proxy == null ? (short)0 : proxy->GetCurrentInstance();
+        var proxyCrossWorldDuty = proxy != null && proxy->IsInCrossWorldDuty();
+        var zoneInit = zoneInstanceSnapshotService.GetSnapshot();
+        var replayManager = ContentsReplayManager.Instance();
+        var hasReplayZoneInit = replayManager != null && replayManager->ZoneInitPacket.TerritoryTypeId != 0;
+        var eventFramework = EventFramework.Instance();
+        var publicContentDirector = eventFramework == null ? null : eventFramework->GetPublicContentDirector();
+        var preferredInstanceCandidate = ResolvePreferredInstanceCandidate(
+            0,
+            proxyCurrentInstance,
+            networkModule == null ? (short)0 : networkModule->CurrentInstance,
+            Plugin.ClientState.Instance,
+            zoneInit,
+            replayManager,
+            hasReplayZoneInit,
+            out var preferredInstanceSource);
+        var preferredServerIdCandidate = ResolvePreferredServerIdCandidate(zoneInit, replayManager, hasReplayZoneInit, out var preferredServerIdSource);
+        var preferredPopRangeCandidate = ResolvePreferredPopRangeCandidate(zoneInit, replayManager, hasReplayZoneInit, publicContentDirector, out var preferredPopRangeSource);
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Framework: {FormatPointer(framework)}",
+            "Framework / NetworkModule instance state snapshot.",
+            new[]
+            {
+                SummaryRow("Framework", FormatPointer(framework), ((nint)framework).ToString("X", CultureInfo.InvariantCulture), "Framework singleton address"),
+                SummaryRow("NetworkModuleProxy", FormatPointer(proxy), proxy == null ? "0" : ((nint)proxy).ToString("X", CultureInfo.InvariantCulture), "Framework-owned NetworkModuleProxy"),
+                SummaryRow("NetworkModule", FormatPointer(networkModule), networkModule == null ? "0" : ((nint)networkModule).ToString("X", CultureInfo.InvariantCulture), "Backed Application::Network::NetworkModule"),
+                SummaryRow("IsNetworkModuleInitialized", framework->IsNetworkModuleInitialized, framework->IsNetworkModuleInitialized, "Framework-side network module initialization state"),
+                SummaryRow("EnableNetworking", framework->EnableNetworking, framework->EnableNetworking, "Framework-side networking enable flag"),
+                SummaryRow("Proxy.GetCurrentInstance()", proxyCurrentInstance, proxyCurrentInstance, "Current instance returned by NetworkModuleProxy"),
+                SummaryRow("NetworkModule.CurrentInstance", networkModule == null ? 0 : networkModule->CurrentInstance, networkModule == null ? 0 : networkModule->CurrentInstance, "Backing short field stored in NetworkModule"),
+                SummaryRow("PreferredInstanceCandidate", preferredInstanceCandidate == 0 ? "<none>" : preferredInstanceCandidate, preferredInstanceCandidate, "First non-zero candidate from NetworkModuleProxy.GetCurrentInstance() -> NetworkModule.CurrentInstance -> Dalamud.ClientState.Instance -> LastZoneInit.PacketInstance -> ReplayZoneInit.Instance"),
+                SummaryRow("PreferredInstanceSource", preferredInstanceSource, preferredInstanceSource, "Source currently supplying PreferredInstanceCandidate"),
+                SummaryRow("PreferredServerIdCandidate", preferredServerIdCandidate == 0 ? "<none>" : preferredServerIdCandidate, preferredServerIdCandidate, "First non-zero server-id candidate from LastZoneInit.ServerId -> ReplayZoneInit.ServerId"),
+                SummaryRow("PreferredServerIdSource", preferredServerIdSource, preferredServerIdSource, "Source currently supplying PreferredServerIdCandidate"),
+                SummaryRow("PreferredPopRangeCandidate", preferredPopRangeCandidate == 0 ? "<none>" : preferredPopRangeCandidate, preferredPopRangeCandidate, "First non-zero layout/pop-range candidate from LastZoneInit.PopRangeId -> ReplayZoneInit.PopRangeId -> PublicContent.LGBPopRange"),
+                SummaryRow("PreferredPopRangeSource", preferredPopRangeSource, preferredPopRangeSource, "Source currently supplying PreferredPopRangeCandidate"),
+                SummaryRow("Dalamud.ClientState.Instance", Plugin.ClientState.Instance, Plugin.ClientState.Instance, "Dalamud client-state instance maintained from NetworkModuleProxy.SetCurrentInstance"),
+                SummaryRow("LastZoneInit.ServerId", zoneInit.HasCapturedPacket ? zoneInit.ServerId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.ServerId : 0, "Server id from the last captured InitZone packet"),
+                SummaryRow("LastZoneInit.PacketInstance", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : 0, "Packet `Instance` from the last captured InitZone packet"),
+                SummaryRow("LastZoneInit.PopRangeId", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : 0, "Packet `PopRangeId` from the last captured InitZone packet; ClientStructs notes this as the PlanMap instance id"),
+                SummaryRow("ReplayZoneInit.ServerId", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : 0, "Server id from the ZoneInitPacket cached on ContentsReplayManager"),
+                SummaryRow("ReplayZoneInit.Instance", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : 0, "ZoneInitPacket.Instance cached on ContentsReplayManager"),
+                SummaryRow("ReplayZoneInit.PopRangeId", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : 0, "PopRangeId from the cached ZoneInitPacket"),
+                SummaryRow("Proxy.IsInCrossWorldDuty()", proxyCrossWorldDuty, proxyCrossWorldDuty, "Current cross-world duty helper result"),
+                SummaryRow("NetworkModule.IsInCrossWorldDuty", networkModule != null && networkModule->IsInCrossWorldDuty, networkModule != null && networkModule->IsInCrossWorldDuty, "Backing cross-world duty flag on NetworkModule"),
+                SummaryRow("NetworkModule.World", networkModule == null ? string.Empty : networkModule->World.ToString(), networkModule == null ? string.Empty : networkModule->World.ToString(), "World string cached by NetworkModule"),
+                SummaryRow("NetworkModule.ZoneName", networkModule == null ? string.Empty : networkModule->ZoneName.ToString(), networkModule == null ? string.Empty : networkModule->ZoneName.ToString(), "Zone-name string cached by NetworkModule"),
+                SummaryRow("FrontHost", networkModule == null ? string.Empty : networkModule->FrontHost.ToString(), networkModule == null ? string.Empty : networkModule->FrontHost.ToString(), "Current frontend host"),
+                SummaryRow("FrontPort", networkModule == null ? 0 : networkModule->FrontPort, networkModule == null ? 0 : networkModule->FrontPort, "Current frontend port"),
+                SummaryRow("LobbyPing", networkModule == null ? 0 : networkModule->LobbyPing, networkModule == null ? 0 : networkModule->LobbyPing, "Current lobby ping reported by NetworkModule"),
+                SummaryRow("CurrentDeviceTime", FormatUnixTimestamp(networkModule == null ? 0 : networkModule->CurrentDeviceTime), networkModule == null ? 0 : networkModule->CurrentDeviceTime, "Network-module device time timestamp"),
+                SummaryRow("KeepAliveZone", networkModule == null ? 0 : networkModule->KeepAliveZone, networkModule == null ? 0 : networkModule->KeepAliveZone, "Zone keepalive timestamp/value"),
+                SummaryRow("KeepAliveIntervalZone", networkModule == null ? 0 : networkModule->KeepAliveIntervalZone, networkModule == null ? 0 : networkModule->KeepAliveIntervalZone, "Zone keepalive interval"),
+                SummaryRow("KeepAliveChat", networkModule == null ? 0 : networkModule->KeepAliveChat, networkModule == null ? 0 : networkModule->KeepAliveChat, "Chat keepalive timestamp/value"),
+                SummaryRow("KeepAliveIntervalChat", networkModule == null ? 0 : networkModule->KeepAliveIntervalChat, networkModule == null ? 0 : networkModule->KeepAliveIntervalChat, "Chat keepalive interval")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadZoneInitPacket(ClientStructsSheetDefinition definition)
+    {
+        var snapshot = zoneInstanceSnapshotService.GetSnapshot();
+        var replayManager = ContentsReplayManager.Instance();
+        var hasReplayZoneInit = replayManager != null && replayManager->ZoneInitPacket.TerritoryTypeId != 0;
+        var gameMain = GameMain.Instance();
+        var agentMap = TryGetAgentMap();
+        var eventFramework = EventFramework.Instance();
+        var publicContentDirector = eventFramework == null ? null : eventFramework->GetPublicContentDirector();
+
+        return CreateSummarySnapshot(
+            definition,
+            snapshot.HasCapturedPacket
+                ? $"Captured: {snapshot.CapturedAtUtc:yyyy-MM-dd HH:mm:ss} UTC"
+                : "No InitZone packet captured yet.",
+            "Last raw InitZone packet observed by HUD Navigator.",
+            new[]
+            {
+                SummaryRow("HookActive", snapshot.HookActive, snapshot.HookActive, "Whether the plugin-level UIModule.HandlePacket hook for InitZone is active"),
+                SummaryRow("HasCapturedPacket", snapshot.HasCapturedPacket, snapshot.HasCapturedPacket, "Whether an InitZone packet has been seen since the plugin loaded"),
+                SummaryRow("CapturedAtUtc", snapshot.HasCapturedPacket ? snapshot.CapturedAtUtc.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.CapturedAtUtc.ToString("O", CultureInfo.InvariantCulture) : string.Empty, "UTC timestamp of the last captured InitZone packet"),
+                SummaryRow("Dalamud.ClientState.Instance", snapshot.DalamudClientStateInstance, snapshot.DalamudClientStateInstance, "Dalamud client-state instance maintained from NetworkModuleProxy.SetCurrentInstance"),
+                SummaryRow("ServerId", snapshot.HasCapturedPacket ? snapshot.ServerId : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.ServerId : 0, "Server id from the last InitZone packet"),
+                SummaryRow("TerritoryTypeId", snapshot.HasCapturedPacket ? ResolveTerritoryName(snapshot.TerritoryTypeId) : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.TerritoryTypeId : 0, "Territory id from the last InitZone packet"),
+                SummaryRow("Packet.Instance", snapshot.HasCapturedPacket ? snapshot.PacketInstance : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.PacketInstance : 0, "Packet `Instance`; only meaningful when the zone-init flags say the area is instanced"),
+                SummaryRow("Packet.ContentFinderConditionId", snapshot.HasCapturedPacket ? ResolveContentFinderConditionName(snapshot.ContentFinderConditionId) : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.ContentFinderConditionId : 0, "ContentFinderCondition id from the last InitZone packet"),
+                SummaryRow("Packet.TransitionTerritoryFilterKey", snapshot.HasCapturedPacket ? snapshot.TransitionTerritoryFilterKey : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.TransitionTerritoryFilterKey : 0, "Transition territory filter key from the last InitZone packet"),
+                SummaryRow("Packet.PopRangeId", snapshot.HasCapturedPacket ? snapshot.PopRangeId : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.PopRangeId : 0, "Packet `PopRangeId`; ClientStructs documents this as the PlanMap instance id"),
+                SummaryRow("Packet.WeatherId", snapshot.HasCapturedPacket ? ResolveWeatherName(snapshot.WeatherId) : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.WeatherId : 0, "Weather id from the last InitZone packet"),
+                SummaryRow("Packet.Flags", snapshot.HasCapturedPacket ? FormatZoneInitFlags(snapshot.Flags) : "<unavailable>", snapshot.HasCapturedPacket ? (ushort)snapshot.Flags : 0, "Zone-init flags bitfield from the last InitZone packet"),
+                SummaryRow("Packet.Flags.IsInstancedArea", snapshot.HasCapturedPacket && snapshot.PacketSaysInstancedArea, snapshot.HasCapturedPacket && snapshot.PacketSaysInstancedArea, "Whether the last InitZone packet marked the area as instanced"),
+                SummaryRow("ReplayCache.Status", replayManager == null ? "<unavailable>" : FormatEnumValue(replayManager->Status), replayManager == null ? 0 : (byte)replayManager->Status, "ContentsReplayManager status flags"),
+                SummaryRow("ReplayCache.TerritoryTypeId", hasReplayZoneInit ? ResolveTerritoryName(replayManager->ZoneInitPacket.TerritoryTypeId) : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.TerritoryTypeId : 0, "Territory id from the ZoneInitPacket cached on ContentsReplayManager"),
+                SummaryRow("ReplayCache.ServerId", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : 0, "Server id from the ZoneInitPacket cached on ContentsReplayManager"),
+                SummaryRow("ReplayCache.Instance", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : 0, "ZoneInitPacket.Instance cached on ContentsReplayManager"),
+                SummaryRow("ReplayCache.ContentFinderConditionId", hasReplayZoneInit ? ResolveContentFinderConditionName(replayManager->ZoneInitPacket.ContentFinderConditionId) : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.ContentFinderConditionId : 0, "ContentFinderCondition id from the cached ZoneInitPacket"),
+                SummaryRow("ReplayCache.TransitionTerritoryFilterKey", hasReplayZoneInit ? replayManager->ZoneInitPacket.TransitionTerritoryFilterKey : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.TransitionTerritoryFilterKey : 0, "Transition territory filter key from the cached ZoneInitPacket"),
+                SummaryRow("ReplayCache.PopRangeId", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : 0, "PopRangeId from the cached ZoneInitPacket"),
+                SummaryRow("ReplayCache.Flags", hasReplayZoneInit ? FormatZoneInitFlags(replayManager->ZoneInitPacket.Flags) : "<unavailable>", hasReplayZoneInit ? (ushort)replayManager->ZoneInitPacket.Flags : 0, "Zone-init flags stored on ContentsReplayManager"),
+                SummaryRow("GameMain.CurrentTerritoryFilterKey", gameMain == null ? 0 : gameMain->CurrentTerritoryFilterKey, gameMain == null ? 0 : gameMain->CurrentTerritoryFilterKey, "Current territory filter key from GameMain"),
+                SummaryRow("GameMain.TransitionTerritoryFilterKey", gameMain == null ? 0 : gameMain->TransitionTerritoryFilterKey, gameMain == null ? 0 : gameMain->TransitionTerritoryFilterKey, "Transition territory filter key from GameMain"),
+                SummaryRow("AgentMap.CurrentMapMarkerRange", agentMap == null ? 0 : agentMap->CurrentMapMarkerRange, agentMap == null ? 0 : agentMap->CurrentMapMarkerRange, "Current map marker range from AgentMap"),
+                SummaryRow("AgentMap.SelectedMapMarkerRange", agentMap == null ? 0 : agentMap->SelectedMapMarkerRange, agentMap == null ? 0 : agentMap->SelectedMapMarkerRange, "Selected map marker range from AgentMap"),
+                SummaryRow("PublicContent.LGBPopRange", publicContentDirector == null ? 0 : publicContentDirector->LGBPopRange, publicContentDirector == null ? 0 : publicContentDirector->LGBPopRange, "Active public-content pop-range field"),
+                SummaryRow("PublicContent.LGBEventRange", publicContentDirector == null ? 0 : publicContentDirector->LGBEventRange, publicContentDirector == null ? 0 : publicContentDirector->LGBEventRange, "Active public-content event-range field")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadContentsFinder(ClientStructsSheetDefinition definition)
+    {
+        var contentsFinder = ContentsFinder.Instance();
+        if (contentsFinder == null)
+            return CreateEmptySnapshot(definition, "ContentsFinder.Instance() returned null.");
+
+        var instanceContent = UIState.Instance();
+        var queueInfo = contentsFinder->GetQueueInfo();
+        var queuedEntries = string.Empty;
+        if (queueInfo != null)
+        {
+            var parts = new List<string>();
+            var entries = queueInfo->QueuedEntries;
+            for (var i = 0; i < entries.Length; i++)
+            {
+                var entry = entries[i];
+                if (entry.ContentType == AgentContentsType.None && entry.Id == 0)
+                    continue;
+
+                parts.Add(ResolveQueueEntry(entry));
+            }
+
+            queuedEntries = string.Join(" | ", parts);
+        }
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Pointer: {FormatPointer(contentsFinder)}",
+            "ContentsFinder and queue snapshot.",
+            new[]
+            {
+                SummaryRow("Pointer", FormatPointer(contentsFinder), ((nint)contentsFinder).ToString("X", CultureInfo.InvariantCulture), "ContentsFinder singleton address"),
+                SummaryRow("LootRules", FormatEnumValue(contentsFinder->LootRules), (byte)contentsFinder->LootRules, "Current loot-rule mode"),
+                SummaryRow("IsUnrestrictedParty", contentsFinder->IsUnrestrictedParty, contentsFinder->IsUnrestrictedParty, "Unrestricted party toggle"),
+                SummaryRow("IsMinimalIL", contentsFinder->IsMinimalIL, contentsFinder->IsMinimalIL, "Minimum item level toggle"),
+                SummaryRow("IsSilenceEcho", contentsFinder->IsSilenceEcho, contentsFinder->IsSilenceEcho, "Silence Echo toggle"),
+                SummaryRow("IsExplorerMode", contentsFinder->IsExplorerMode, contentsFinder->IsExplorerMode, "Explorer mode toggle"),
+                SummaryRow("IsLevelSync", contentsFinder->IsLevelSync, contentsFinder->IsLevelSync, "Level sync toggle"),
+                SummaryRow("IsLimitedLevelingRoulette", contentsFinder->IsLimitedLevelingRoulette, contentsFinder->IsLimitedLevelingRoulette, "Limited leveling roulette toggle"),
+                SummaryRow("QueueState", queueInfo == null ? "Unavailable" : FormatEnumValue(queueInfo->QueueState), queueInfo == null ? 0 : (byte)queueInfo->QueueState, "Current duty-finder queue state"),
+                SummaryRow("InfoState.ContentType", queueInfo == null ? "Unavailable" : FormatEnumValue(queueInfo->InfoState.ContentType), queueInfo == null ? 0 : (byte)queueInfo->InfoState.ContentType, "Queue info-state content type"),
+                SummaryRow("InfoState.IsReservingServer", queueInfo != null && queueInfo->InfoState.IsReservingServer, queueInfo != null && queueInfo->InfoState.IsReservingServer, "Whether the queue is reserving a server"),
+                SummaryRow("QueuedEntries", string.IsNullOrWhiteSpace(queuedEntries) ? "<none>" : queuedEntries, queuedEntries, "Queued roulette/duty entries"),
+                SummaryRow("QueuedClassJobId", queueInfo == null ? 0 : queueInfo->QueuedClassJobId, queueInfo == null ? 0 : queueInfo->QueuedClassJobId, "Queued class/job row id"),
+                SummaryRow("QueuedContentRouletteId", queueInfo == null ? 0 : ResolveContentRouletteName(queueInfo->QueuedContentRouletteId), queueInfo == null ? 0 : queueInfo->QueuedContentRouletteId, "Queued roulette row id when applicable"),
+                SummaryRow("PositionInQueue", queueInfo == null ? 0 : queueInfo->PositionInQueue, queueInfo == null ? 0 : queueInfo->PositionInQueue, "Reported queue position"),
+                SummaryRow("ClampedPositionInQueue", queueInfo == null ? 0 : queueInfo->ClampedPositionInQueue, queueInfo == null ? 0 : queueInfo->ClampedPositionInQueue, "Clamped queue position"),
+                SummaryRow("EnteredQueueTimestamp", queueInfo == null ? "0" : FormatUnixTimestamp(queueInfo->EnteredQueueTimestamp), queueInfo == null ? 0 : queueInfo->EnteredQueueTimestamp, "Queue-entry timestamp"),
+                SummaryRow("QueueReadyTimestamp", queueInfo == null ? "0" : FormatUnixTimestamp(queueInfo->QueueReadyTimestamp), queueInfo == null ? 0 : queueInfo->QueueReadyTimestamp, "Queue-ready timestamp"),
+                SummaryRow("NextQueueUpdateTimestamp", queueInfo == null ? "0" : FormatUnixTimestamp(queueInfo->NextQueueUpdateTimestamp), queueInfo == null ? 0 : queueInfo->NextQueueUpdateTimestamp, "Next queue-update timestamp"),
+                SummaryRow("PoppedQueueEntry", queueInfo == null ? "<none>" : ResolveQueueEntry(queueInfo->PoppedQueueEntry), queueInfo == null ? string.Empty : ResolveQueueEntry(queueInfo->PoppedQueueEntry), "Duty/roulette entry that has currently popped"),
+                SummaryRow("PoppedContentFlags", queueInfo == null ? "<none>" : $"Unrestricted={queueInfo->PoppedContentIsUnrestrictedParty} MinimalIL={queueInfo->PoppedContentIsMinimalIL} LevelSync={queueInfo->PoppedContentIsLevelSync} SilenceEcho={queueInfo->PoppedContentIsSilenceEcho} Explorer={queueInfo->PoppedContentIsExplorerMode}", queueInfo == null ? string.Empty : $"{queueInfo->PoppedContentIsUnrestrictedParty},{queueInfo->PoppedContentIsMinimalIL},{queueInfo->PoppedContentIsLevelSync},{queueInfo->PoppedContentIsSilenceEcho},{queueInfo->PoppedContentIsExplorerMode}", "Toggles attached to the currently popped content"),
+                SummaryRow("DutyPenaltyMinutes", instanceContent == null ? 0 : instanceContent->InstanceContent.GetPenaltyRemainingInMinutes(0), instanceContent == null ? 0 : instanceContent->InstanceContent.GetPenaltyRemainingInMinutes(0), "Duty Finder penalty timer in minutes"),
+                SummaryRow("InactivityPenaltyMinutes", instanceContent == null ? 0 : instanceContent->InstanceContent.GetPenaltyRemainingInMinutes(1), instanceContent == null ? 0 : instanceContent->InstanceContent.GetPenaltyRemainingInMinutes(1), "Inactivity / PvP penalty timer in minutes"),
+                SummaryRow("RankedCrystallineConflictHostingDataCenterId", instanceContent == null ? 0 : instanceContent->InstanceContent.RankedCrystallineConflictHostingDataCenterId, instanceContent == null ? 0 : instanceContent->InstanceContent.RankedCrystallineConflictHostingDataCenterId, "Hosting data center id for ranked CC queue state"),
+                SummaryRow("IsLimitedTimeBonusActive", instanceContent != null && instanceContent->InstanceContent.IsLimitedTimeBonusActive, instanceContent != null && instanceContent->InstanceContent.IsLimitedTimeBonusActive, "Limited-time bonus flag")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadEventFramework(ClientStructsSheetDefinition definition)
+    {
+        var eventFramework = EventFramework.Instance();
+        if (eventFramework == null)
+            return CreateEmptySnapshot(definition, "EventFramework.Instance() returned null.");
+
+        var contentDirector = eventFramework->GetContentDirector();
+        var instanceContentDirector = eventFramework->GetInstanceContentDirector();
+        var publicContentDirector = eventFramework->GetPublicContentDirector();
+        var eurekaDirector = EventFramework.GetPublicContentDirectorByType(PublicContentDirectorType.Eureka);
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Pointer: {FormatPointer(eventFramework)}",
+            "Live EventFramework and director snapshot.",
+            new[]
+            {
+                SummaryRow("Pointer", FormatPointer(eventFramework), ((nint)eventFramework).ToString("X", CultureInfo.InvariantCulture), "EventFramework singleton address"),
+                SummaryRow("LoadState", eventFramework->LoadState, eventFramework->LoadState, "0-6 lifecycle state for event framework modules"),
+                SummaryRow("DirectorModule.ActiveContentDirector", FormatPointer(eventFramework->DirectorModule.ActiveContentDirector), eventFramework->DirectorModule.ActiveContentDirector == null ? "0" : ((nint)eventFramework->DirectorModule.ActiveContentDirector).ToString("X", CultureInfo.InvariantCulture), "DirectorModule active content-director pointer"),
+                SummaryRow("GetContentDirector()", FormatPointer(contentDirector), contentDirector == null ? "0" : ((nint)contentDirector).ToString("X", CultureInfo.InvariantCulture), "Generic active content director"),
+                SummaryRow("GetInstanceContentDirector()", FormatPointer(instanceContentDirector), instanceContentDirector == null ? "0" : ((nint)instanceContentDirector).ToString("X", CultureInfo.InvariantCulture), "Active instance-content director pointer"),
+                SummaryRow("GetPublicContentDirector()", FormatPointer(publicContentDirector), publicContentDirector == null ? "0" : ((nint)publicContentDirector).ToString("X", CultureInfo.InvariantCulture), "Active public-content director pointer"),
+                SummaryRow("GetPublicContentDirectorByType(Eureka)", FormatPointer(eurekaDirector), eurekaDirector == null ? "0" : ((nint)eurekaDirector).ToString("X", CultureInfo.InvariantCulture), "Direct lookup for the Eureka public-content director"),
+                SummaryRow("CurrentContentType", FormatContentType(EventFramework.GetCurrentContentType()), (byte)EventFramework.GetCurrentContentType(), "Current EventFramework content-type enum"),
+                SummaryRow("CurrentContentId", EventFramework.GetCurrentContentId(), EventFramework.GetCurrentContentId(), "Current EventFramework content id"),
+                SummaryRow("CanLeaveCurrentContent()", EventFramework.CanLeaveCurrentContent(), EventFramework.CanLeaveCurrentContent(), "Static helper for leaving the active content"),
+                SummaryRow("ActiveDirector.ContentId", contentDirector == null ? 0 : contentDirector->ContentId, contentDirector == null ? 0 : contentDirector->ContentId, "Active director content id"),
+                SummaryRow("ActiveDirector.Sequence", contentDirector == null ? 0 : contentDirector->Sequence, contentDirector == null ? 0 : contentDirector->Sequence, "Active director sequence byte"),
+                SummaryRow("ActiveDirector.EventItemId", contentDirector == null ? 0 : contentDirector->EventItemId, contentDirector == null ? 0 : contentDirector->EventItemId, "Active director event-item id"),
+                SummaryRow("PublicDirector.Type", publicContentDirector == null ? "None" : FormatPublicContentDirectorType(publicContentDirector->Type), publicContentDirector == null ? 0 : (byte)publicContentDirector->Type, "Current public-content director type when available"),
+                SummaryRow("PublicDirector.ContentFinderCondition", publicContentDirector == null ? "0" : ResolveContentFinderConditionName(publicContentDirector->ContentFinderCondition), publicContentDirector == null ? 0 : publicContentDirector->ContentFinderCondition, "Content finder condition attached to the active public-content director"),
+                SummaryRow("PublicDirector.AdditionalData", publicContentDirector == null ? 0 : publicContentDirector->AdditionalData, publicContentDirector == null ? 0 : publicContentDirector->AdditionalData, "Public-content additional data field")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadContentDirector(ClientStructsSheetDefinition definition)
+    {
+        var eventFramework = EventFramework.Instance();
+        if (eventFramework == null)
+            return CreateEmptySnapshot(definition, "EventFramework.Instance() returned null.");
+
+        var contentDirector = eventFramework->GetContentDirector();
+        if (contentDirector == null)
+            return CreateEmptySnapshot(definition, "EventFramework has no active content director.");
+
+        var instanceContentDirector = eventFramework->GetInstanceContentDirector();
+        var publicContentDirector = eventFramework->GetPublicContentDirector();
+        var directorKind = instanceContentDirector != null
+            ? "InstanceContentDirector"
+            : publicContentDirector != null
+                ? "PublicContentDirector"
+                : "ContentDirector";
+
+        uint currentLevel = 0;
+        uint maxLevel = 0;
+        uint contentTimeMaxSeconds = 0;
+        try { currentLevel = contentDirector->GetCurrentLevel(); } catch { }
+        try { maxLevel = contentDirector->GetMaxLevel(); } catch { }
+        try { contentTimeMaxSeconds = contentDirector->GetContentTimeMax(); } catch { }
+
+        var mapEffects = contentDirector->MapEffects;
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Pointer: {FormatPointer(contentDirector)}",
+            $"Active director snapshot ({directorKind}).",
+            new[]
+            {
+                SummaryRow("Pointer", FormatPointer(contentDirector), ((nint)contentDirector).ToString("X", CultureInfo.InvariantCulture), "Active content-director pointer"),
+                SummaryRow("DirectorKind", directorKind, directorKind, "Most specific resolved active director type"),
+                SummaryRow("ContentId", contentDirector->ContentId, contentDirector->ContentId, "Active director content id"),
+                SummaryRow("ContentFlags", contentDirector->ContentFlags, contentDirector->ContentFlags, "Raw content flags byte"),
+                SummaryRow("Sequence", contentDirector->Sequence, contentDirector->Sequence, "Current director sequence"),
+                SummaryRow("Title", contentDirector->Title.ToString(), contentDirector->Title.ToString(), "Director title text"),
+                SummaryRow("Objective", contentDirector->Objective.ToString(), contentDirector->Objective.ToString(), "Director objective text"),
+                SummaryRow("ReliefText", contentDirector->ReliefText.ToString(), contentDirector->ReliefText.ToString(), "Director relief text"),
+                SummaryRow("EventItemId", contentDirector->EventItemId, contentDirector->EventItemId, "Active event-item id"),
+                SummaryRow("DirectorStartTimestamp", FormatUnixTimestamp(contentDirector->DirectorStartTimestamp), contentDirector->DirectorStartTimestamp, "Director start timestamp"),
+                SummaryRow("DirectorEndTimestamp", FormatUnixTimestamp(contentDirector->DirectorEndTimestamp), contentDirector->DirectorEndTimestamp, "Director end timestamp"),
+                SummaryRow("ContentTimeLeft", contentDirector->ContentTimeLeft.ToString("F1", CultureInfo.InvariantCulture), contentDirector->ContentTimeLeft, "Remaining content time reported by ContentDirector"),
+                SummaryRow("GetContentTimeMax()", contentTimeMaxSeconds, contentTimeMaxSeconds, "Maximum content time in seconds"),
+                SummaryRow("GetCurrentLevel()", currentLevel, currentLevel, "Virtual current-level helper"),
+                SummaryRow("GetMaxLevel()", maxLevel, maxLevel, "Virtual max-level helper"),
+                SummaryRow("MapEffects", FormatPointer(mapEffects), mapEffects == null ? "0" : ((nint)mapEffects).ToString("X", CultureInfo.InvariantCulture), "Pointer to the live ContentDirector map-effect list"),
+                SummaryRow("MapEffects.ItemCount", mapEffects == null ? 0 : mapEffects->ItemCount, mapEffects == null ? 0 : mapEffects->ItemCount, "Number of live shared-group/map-effect items"),
+                SummaryRow("MapEffects.ContentDirectorManagedSGRowId", mapEffects == null ? 0 : mapEffects->ContentDirectorManagedSGRowId, mapEffects == null ? 0 : mapEffects->ContentDirectorManagedSGRowId, "Backing managed shared-group row id"),
+                SummaryRow("MapEffects.Dirty", mapEffects == null ? 0 : mapEffects->Dirty, mapEffects == null ? 0 : mapEffects->Dirty, "Dirty flag for live map effects"),
+                SummaryRow("DirectorTodos.Count", contentDirector->DirectorTodos.Count, contentDirector->DirectorTodos.Count, "Number of active director todo entries"),
+                SummaryRow("InstanceContentType", instanceContentDirector == null ? "Unavailable" : FormatEnumValue(instanceContentDirector->InstanceContentType), instanceContentDirector == null ? 0 : (byte)instanceContentDirector->InstanceContentType, "Typed instance-content category when a duty director is active"),
+                SummaryRow("InstanceContent.ReqInstance", instanceContentDirector == null ? 0 : instanceContentDirector->ReqInstance, instanceContentDirector == null ? 0 : instanceContentDirector->ReqInstance, "Instance-content requirement / request field"),
+                SummaryRow("InstanceContent.LGBEventRange", instanceContentDirector == null ? 0 : instanceContentDirector->LGBEventRange, instanceContentDirector == null ? 0 : instanceContentDirector->LGBEventRange, "Instance-content LGB event range field"),
+                SummaryRow("InstanceContent.InstanceClearGil", instanceContentDirector == null ? 0 : instanceContentDirector->InstanceClearGil, instanceContentDirector == null ? 0 : instanceContentDirector->InstanceClearGil, "Instance clear gil reward"),
+                SummaryRow("InstanceContent.InstanceClearExp", instanceContentDirector == null ? 0 : instanceContentDirector->InstanceClearExp, instanceContentDirector == null ? 0 : instanceContentDirector->InstanceClearExp, "Instance clear exp reward"),
+                SummaryRow("InstanceContent.RewardItem", instanceContentDirector == null ? "0" : ResolveItemName(instanceContentDirector->InstanceContentRewardItem), instanceContentDirector == null ? 0 : instanceContentDirector->InstanceContentRewardItem, "Instance-content reward item row id"),
+                SummaryRow("PublicContent.Type", publicContentDirector == null ? "Unavailable" : FormatPublicContentDirectorType(publicContentDirector->Type), publicContentDirector == null ? 0 : (byte)publicContentDirector->Type, "Public-content type when a public-content director is active"),
+                SummaryRow("PublicContent.ContentFinderCondition", publicContentDirector == null ? "0" : ResolveContentFinderConditionName(publicContentDirector->ContentFinderCondition), publicContentDirector == null ? 0 : publicContentDirector->ContentFinderCondition, "Public-content ContentFinderCondition"),
+                SummaryRow("PublicContent.Timelimit", publicContentDirector == null ? 0 : publicContentDirector->Timelimit, publicContentDirector == null ? 0 : publicContentDirector->Timelimit, "Public-content timelimit field"),
+                SummaryRow("PublicContent.AdditionalData", publicContentDirector == null ? 0 : publicContentDirector->AdditionalData, publicContentDirector == null ? 0 : publicContentDirector->AdditionalData, "Public-content additional data"),
+                SummaryRow("PublicContent.MapIcon", publicContentDirector == null ? 0 : publicContentDirector->MapIcon, publicContentDirector == null ? 0 : publicContentDirector->MapIcon, "Public-content map icon id"),
+                SummaryRow("PublicContent.LGBEventRange", publicContentDirector == null ? 0 : publicContentDirector->LGBEventRange, publicContentDirector == null ? 0 : publicContentDirector->LGBEventRange, "Public-content LGB event range"),
+                SummaryRow("PublicContent.LGBPopRange", publicContentDirector == null ? 0 : publicContentDirector->LGBPopRange, publicContentDirector == null ? 0 : publicContentDirector->LGBPopRange, "Public-content pop-range field that may help with instance/layout correlation")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadDirectorTodos(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
+    {
+        var eventFramework = EventFramework.Instance();
+        if (eventFramework == null)
+            return CreateEmptySnapshot(definition, "EventFramework.Instance() returned null.");
+
+        var contentDirector = eventFramework->GetContentDirector();
+        if (contentDirector == null)
+            return CreateEmptySnapshot(definition, "EventFramework has no active content director.");
+
+        var todos = contentDirector->DirectorTodos;
+        var totalRows = todos.Count;
+        var columns = CreateColumns(
+            Column("Idx", "Index", "Director todo vector index", 56f),
+            Column("Enabled", "bool", "Whether the todo row is enabled", 66f),
+            Column("Complete", "bool", "Whether the todo row is complete", 72f),
+            Column("Check", "bool", "Whether the row should gray out on completion", 66f),
+            Column("Type", "enum", "Todo type discriminator", 90f),
+            Column("Text", "Utf8String", "Todo text payload", 320f),
+            Column("Current", "int", "Current progress/count value", 74f),
+            Column("Needed", "int", "Needed progress/count value", 74f),
+            Column("EndTime", "long", "Todo end timestamp when used", 150f),
+            Column("Duration", "long", "Todo duration in seconds when used", 110f));
+
+        var visibleRows = new List<ClientStructsSheetRow>();
+        BuildWindow(totalRows, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
+        for (var offset = 0; offset < rowsToLoad; offset++)
+        {
+            var rowIndex = startIndex + offset;
+            var todo = todos[rowIndex];
+            visibleRows.Add(CreateRow(
+                rowIndex,
+                (uint)rowIndex,
+                Cell(rowIndex),
+                Cell(todo.Enabled),
+                Cell(todo.Complete),
+                Cell(todo.CheckOnCompletion),
+                Cell(FormatEnumValue(todo.Type), (int)todo.Type),
+                Cell(todo.Text.ToString(), todo.Text.ToString()),
+                Cell(todo.CurrentCount),
+                Cell(todo.NeededCount),
+                Cell(FormatUnixTimestamp((int)todo.EndTimestamp), todo.EndTimestamp),
+                Cell(todo.Duration)));
+        }
+
+        var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {totalRows} - Active director todos";
+        return CreateSnapshot(definition, columns, visibleRows, totalRows, startIndex, request.RowCount, $"Pointer: {FormatPointer(contentDirector)}", message);
+    }
+
+    private ClientStructsSheetSnapshot ReadDynamicEvents(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
+    {
+        var eventFramework = EventFramework.Instance();
+        var publicDirector = eventFramework == null ? null : eventFramework->GetPublicContentDirector();
+
+        DynamicEventContainer* container = null;
+        var source = "DynamicEventContainer.GetInstance()";
+
+        if (publicDirector != null)
+        {
+            switch (publicDirector->Type)
+            {
+                case PublicContentDirectorType.Bozja:
+                {
+                    var bozja = PublicContentBozja.GetInstance();
+                    if (bozja != null)
+                    {
+                        container = &bozja->DynamicEventContainer;
+                        source = "PublicContentBozja.DynamicEventContainer";
+                    }
+                    break;
+                }
+                case PublicContentDirectorType.OccultCrescent:
+                {
+                    var occult = PublicContentOccultCrescent.GetInstance();
+                    if (occult != null)
+                    {
+                        container = &occult->DynamicEventContainer;
+                        source = "PublicContentOccultCrescent.DynamicEventContainer";
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (container == null)
+            container = DynamicEventContainer.GetInstance();
+        if (container == null)
+            return CreateEmptySnapshot(definition, "No dynamic-event container is available.");
+
+        var rows = new List<(int Slot, InstanceDynamicEvent Event)>();
+        for (var i = 0; i < container->Events.Length; i++)
+        {
+            var dynamicEvent = container->Events[i];
+            var name = dynamicEvent.Name.ToString();
+            if (dynamicEvent.DynamicEventId == 0
+                && string.IsNullOrWhiteSpace(name)
+                && dynamicEvent.State == DynamicEventState.Inactive
+                && dynamicEvent.MapMarker.MapId == 0)
+                continue;
+
+            rows.Add((Slot: i, Event: dynamicEvent));
+        }
+
+        var columns = CreateColumns(
+            Column("Slot", "Index", "Dynamic-event array slot", 56f),
+            Column("DynamicEventId", "ushort", "DynamicEventId field", 96f),
+            Column("State", "enum", "Dynamic-event runtime state", 110f),
+            Column("Name", "Utf8String", "Runtime event name", 220f),
+            Column("Description", "Utf8String", "Runtime event description", 260f),
+            Column("Progress", "byte", "Progress percentage or stage", 70f),
+            Column("Participants", "byte", "Current participants", 82f),
+            Column("MaxParticipants", "byte", "Maximum participants", 96f),
+            Column("SecondsLeft", "uint", "Seconds left", 96f),
+            Column("Quest", "Quest", "Quest row id attached to the event", 180f),
+            Column("MapId", "uint", "Attached map id from MapMarkerData", 84f),
+            Column("Territory", "ushort", "Attached territory from MapMarkerData", 180f),
+            Column("Position", "Vector3", "Attached world position from MapMarkerData", 180f),
+            Column("Radius", "float", "Attached radius from MapMarkerData", 76f));
+
+        var visibleRows = new List<ClientStructsSheetRow>();
+        BuildWindow(rows.Count, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
+        for (var offset = 0; offset < rowsToLoad; offset++)
+        {
+            var rowIndex = startIndex + offset;
+            var entry = rows[rowIndex];
+            var dynamicEvent = entry.Event;
+            visibleRows.Add(CreateRow(
+                rowIndex,
+                dynamicEvent.DynamicEventId,
+                Cell(entry.Slot),
+                Cell(dynamicEvent.DynamicEventId),
+                Cell(FormatEnumValue(dynamicEvent.State), (byte)dynamicEvent.State),
+                Cell(dynamicEvent.Name.ToString(), dynamicEvent.Name.ToString()),
+                Cell(dynamicEvent.Description.ToString(), dynamicEvent.Description.ToString()),
+                Cell(dynamicEvent.Progress),
+                Cell(dynamicEvent.Participants),
+                Cell(dynamicEvent.MaxParticipants),
+                Cell(dynamicEvent.SecondsLeft),
+                Cell(ResolveQuestRowName(dynamicEvent.Quest), dynamicEvent.Quest),
+                Cell(dynamicEvent.MapMarker.MapId),
+                Cell(ResolveTerritoryName(dynamicEvent.MapMarker.TerritoryTypeId), dynamicEvent.MapMarker.TerritoryTypeId),
+                Cell(FormatVector3(dynamicEvent.MapMarker.Position), FormatVector3(dynamicEvent.MapMarker.Position)),
+                Cell(dynamicEvent.MapMarker.Radius.ToString("F1", CultureInfo.InvariantCulture), dynamicEvent.MapMarker.Radius)));
+        }
+
+        var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {rows.Count} - CurrentEventId: {container->CurrentEventId} - CurrentEventIndex: {container->CurrentEventIndex} - Source: {source}";
+        return CreateSnapshot(definition, columns, visibleRows, rows.Count, startIndex, request.RowCount, $"Pointer: {FormatPointer(container)}", message);
+    }
+
+    private ClientStructsSheetSnapshot ReadEurekaStatus(ClientStructsSheetDefinition definition)
+    {
+        var gameMain = GameMain.Instance();
+        var playerState = PlayerState.Instance();
+        var uiState = UIState.Instance();
+        var eurekaDirector = (PublicContentEureka*)EventFramework.GetPublicContentDirectorByType(PublicContentDirectorType.Eureka);
+        var eurekaPublicDirector = eurekaDirector == null ? null : (PublicContentDirector*)eurekaDirector;
+        var framework = FrameworkSystem.Instance();
+        var proxy = framework == null ? null : framework->NetworkModuleProxy;
+        var networkModule = proxy == null ? null : proxy->NetworkModule;
+        var proxyCurrentInstance = proxy == null ? (short)0 : proxy->GetCurrentInstance();
+        var zoneInit = zoneInstanceSnapshotService.GetSnapshot();
+        var replayManager = ContentsReplayManager.Instance();
+        var hasReplayZoneInit = replayManager != null && replayManager->ZoneInitPacket.TerritoryTypeId != 0;
+        var agentMap = TryGetAgentMap();
+        var preferredInstanceCandidate = ResolvePreferredInstanceCandidate(
+            uiState == null ? 0u : uiState->PublicInstance.InstanceId,
+            proxyCurrentInstance,
+            networkModule == null ? (short)0 : networkModule->CurrentInstance,
+            Plugin.ClientState.Instance,
+            zoneInit,
+            replayManager,
+            hasReplayZoneInit,
+            out var preferredInstanceSource);
+        var preferredServerIdCandidate = ResolvePreferredServerIdCandidate(zoneInit, replayManager, hasReplayZoneInit, out var preferredServerIdSource);
+        var preferredPopRangeCandidate = ResolvePreferredPopRangeCandidate(zoneInit, replayManager, hasReplayZoneInit, eurekaPublicDirector, out var preferredPopRangeSource);
+
+        return CreateSummarySnapshot(
+            definition,
+            $"EurekaDirector: {FormatPointer(eurekaDirector)}",
+            "Aggregated Eureka runtime state pulled from multiple ClientStructs singletons.",
+            new[]
+            {
+                SummaryRow("InEurekaTerritory", gameMain != null && gameMain->CurrentTerritoryIntendedUseId == ClientTerritoryIntendedUse.Eureka, gameMain != null && gameMain->CurrentTerritoryIntendedUseId == ClientTerritoryIntendedUse.Eureka, "True when GameMain reports TerritoryIntendedUse.Eureka"),
+                SummaryRow("CurrentTerritory", gameMain == null ? "0" : ResolveTerritoryName(gameMain->CurrentTerritoryTypeId), gameMain == null ? 0 : gameMain->CurrentTerritoryTypeId, "Current territory resolved through Lumina"),
+                SummaryRow("CurrentContentFinderCondition", gameMain == null ? "0" : ResolveContentFinderConditionName(gameMain->CurrentContentFinderConditionId), gameMain == null ? 0 : gameMain->CurrentContentFinderConditionId, "Current content finder condition resolved through Lumina"),
+                SummaryRow("PreferredInstanceCandidate", preferredInstanceCandidate == 0 ? "<none>" : preferredInstanceCandidate, preferredInstanceCandidate, "First non-zero candidate from UIState.PublicInstance.InstanceId -> NetworkModuleProxy.GetCurrentInstance() -> NetworkModule.CurrentInstance -> Dalamud.ClientState.Instance -> LastZoneInit.PacketInstance -> ReplayZoneInit.Instance"),
+                SummaryRow("PreferredInstanceSource", preferredInstanceSource, preferredInstanceSource, "Source currently supplying PreferredInstanceCandidate"),
+                SummaryRow("PreferredServerIdCandidate", preferredServerIdCandidate == 0 ? "<none>" : preferredServerIdCandidate, preferredServerIdCandidate, "First non-zero server-id candidate from LastZoneInit.ServerId -> ReplayZoneInit.ServerId"),
+                SummaryRow("PreferredServerIdSource", preferredServerIdSource, preferredServerIdSource, "Source currently supplying PreferredServerIdCandidate"),
+                SummaryRow("PreferredPopRangeCandidate", preferredPopRangeCandidate == 0 ? "<none>" : preferredPopRangeCandidate, preferredPopRangeCandidate, "First non-zero layout/pop-range candidate from LastZoneInit.PopRangeId -> ReplayZoneInit.PopRangeId -> PublicContentEureka.LGBPopRange"),
+                SummaryRow("PreferredPopRangeSource", preferredPopRangeSource, preferredPopRangeSource, "Source currently supplying PreferredPopRangeCandidate"),
+                SummaryRow("PublicInstance.InstanceId", uiState == null ? 0 : uiState->PublicInstance.InstanceId, uiState == null ? 0 : uiState->PublicInstance.InstanceId, "UIState public-instance id"),
+                SummaryRow("Network.GetCurrentInstance()", proxyCurrentInstance, proxyCurrentInstance, "NetworkModuleProxy current instance"),
+                SummaryRow("NetworkModule.CurrentInstance", networkModule == null ? 0 : networkModule->CurrentInstance, networkModule == null ? 0 : networkModule->CurrentInstance, "Backing short field stored in NetworkModule"),
+                SummaryRow("Dalamud.ClientState.Instance", Plugin.ClientState.Instance, Plugin.ClientState.Instance, "Dalamud client-state instance maintained from NetworkModuleProxy.SetCurrentInstance"),
+                SummaryRow("LastZoneInit.ServerId", zoneInit.HasCapturedPacket ? zoneInit.ServerId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.ServerId : 0, "Server id from the last captured InitZone packet; old EurekaHelper-style shard research should compare this against instance and pop-range data"),
+                SummaryRow("LastZoneInit.Instance", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : 0, "Packet `Instance` from the last captured InitZone packet"),
+                SummaryRow("LastZoneInit.TerritoryType", zoneInit.HasCapturedPacket ? ResolveTerritoryName(zoneInit.TerritoryTypeId) : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.TerritoryTypeId : 0, "Territory id from the last captured InitZone packet"),
+                SummaryRow("LastZoneInit.ContentFinderCondition", zoneInit.HasCapturedPacket ? ResolveContentFinderConditionName(zoneInit.ContentFinderConditionId) : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.ContentFinderConditionId : 0, "Content finder condition id from the last captured InitZone packet"),
+                SummaryRow("LastZoneInit.PopRangeId", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : 0, "Packet `PopRangeId` from the last captured InitZone packet; ClientStructs notes this as the PlanMap instance id"),
+                SummaryRow("LastZoneInit.IsInstancedArea", zoneInit.HasCapturedPacket && zoneInit.PacketSaysInstancedArea, zoneInit.HasCapturedPacket && zoneInit.PacketSaysInstancedArea, "Whether the last captured InitZone packet marked the area as instanced"),
+                SummaryRow("ReplayZoneInit.ServerId", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : 0, "Server id from the ZoneInitPacket cached on ContentsReplayManager"),
+                SummaryRow("ReplayZoneInit.Instance", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : 0, "ZoneInitPacket.Instance cached on ContentsReplayManager"),
+                SummaryRow("ReplayZoneInit.TerritoryType", hasReplayZoneInit ? ResolveTerritoryName(replayManager->ZoneInitPacket.TerritoryTypeId) : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.TerritoryTypeId : 0, "Territory id from the ZoneInitPacket cached on ContentsReplayManager"),
+                SummaryRow("ReplayZoneInit.ContentFinderCondition", hasReplayZoneInit ? ResolveContentFinderConditionName(replayManager->ZoneInitPacket.ContentFinderConditionId) : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.ContentFinderConditionId : 0, "Content finder condition id from the cached ZoneInitPacket"),
+                SummaryRow("ReplayZoneInit.PopRangeId", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : 0, "ZoneInitPacket.PopRangeId cached on ContentsReplayManager"),
+                SummaryRow("GameMain.CurrentTerritoryFilterKey", gameMain == null ? 0 : gameMain->CurrentTerritoryFilterKey, gameMain == null ? 0 : gameMain->CurrentTerritoryFilterKey, "Current territory filter key from GameMain"),
+                SummaryRow("GameMain.TransitionTerritoryFilterKey", gameMain == null ? 0 : gameMain->TransitionTerritoryFilterKey, gameMain == null ? 0 : gameMain->TransitionTerritoryFilterKey, "Transition territory filter key from GameMain"),
+                SummaryRow("AgentMap.CurrentMapMarkerRange", agentMap == null ? 0 : agentMap->CurrentMapMarkerRange, agentMap == null ? 0 : agentMap->CurrentMapMarkerRange, "Current map marker range from AgentMap"),
+                SummaryRow("AgentMap.SelectedMapMarkerRange", agentMap == null ? 0 : agentMap->SelectedMapMarkerRange, agentMap == null ? 0 : agentMap->SelectedMapMarkerRange, "Selected map marker range from AgentMap"),
+                SummaryRow("PlayerState.GetContentValue(2)", playerState == null ? 0 : playerState->GetContentValue(2), playerState == null ? 0 : playerState->GetContentValue(2), "Eureka effective elemental level"),
+                SummaryRow("PlayerState.GetContentValue(3)", playerState == null ? 0 : playerState->GetContentValue(3), playerState == null ? 0 : playerState->GetContentValue(3), "Eureka elemental sync flag"),
+                SummaryRow("PlayerState.GetContentValue(4)", playerState == null ? 0 : playerState->GetContentValue(4), playerState == null ? 0 : playerState->GetContentValue(4), "Eureka current elemental level"),
+                SummaryRow("Inspect.GetContentValue(1)", uiState == null ? 0 : uiState->Inspect.GetContentValue(1), uiState == null ? 0 : uiState->Inspect.GetContentValue(1), "Inspect-side Eureka elemental level for the currently inspected target"),
+                SummaryRow("Inspect.GetContentValue(2)", uiState == null ? 0 : uiState->Inspect.GetContentValue(2), uiState == null ? 0 : uiState->Inspect.GetContentValue(2), "Inspect-side Eureka sync flag for the currently inspected target"),
+                SummaryRow("Inspect.GetContentValue(3)", uiState == null ? 0 : uiState->Inspect.GetContentValue(3), uiState == null ? 0 : uiState->Inspect.GetContentValue(3), "Inspect-side Eureka remaining-time field for the currently inspected target"),
+                SummaryRow("PublicContentEureka.Pointer", FormatPointer(eurekaDirector), eurekaDirector == null ? "0" : ((nint)eurekaDirector).ToString("X", CultureInfo.InvariantCulture), "Eureka public-content director pointer; only valid while Eureka content is active"),
+                SummaryRow("PublicContentEureka.ContentFinderCondition", eurekaPublicDirector == null ? "0" : ResolveContentFinderConditionName(eurekaPublicDirector->ContentFinderCondition), eurekaPublicDirector == null ? 0 : eurekaPublicDirector->ContentFinderCondition, "ContentFinderCondition attached to the active Eureka director"),
+                SummaryRow("PublicContentEureka.LGBEventRange", eurekaPublicDirector == null ? 0 : eurekaPublicDirector->LGBEventRange, eurekaPublicDirector == null ? 0 : eurekaPublicDirector->LGBEventRange, "Eureka public-content event-range field"),
+                SummaryRow("PublicContentEureka.LGBPopRange", eurekaPublicDirector == null ? 0 : eurekaPublicDirector->LGBPopRange, eurekaPublicDirector == null ? 0 : eurekaPublicDirector->LGBPopRange, "Eureka public-content pop-range field"),
+                SummaryRow("PublicContentEureka.MaxElementalLevel", eurekaDirector == null ? 0 : eurekaDirector->MaxElementalLevel, eurekaDirector == null ? 0 : eurekaDirector->MaxElementalLevel, "Elemental sync cap announced by the Eureka director"),
+                SummaryRow("PublicContentEureka.CurrentExperience", eurekaDirector == null ? 0 : eurekaDirector->CurrentExperience, eurekaDirector == null ? 0 : eurekaDirector->CurrentExperience, "Current elemental experience"),
+                SummaryRow("PublicContentEureka.NeededExperience", eurekaDirector == null ? 0 : eurekaDirector->NeededExperience, eurekaDirector == null ? 0 : eurekaDirector->NeededExperience, "Experience needed for the next elemental level"),
+                SummaryRow("PublicContentEureka.MagiaAetherCharge", eurekaDirector == null ? 0 : eurekaDirector->MagiaAetherCharge, eurekaDirector == null ? 0 : eurekaDirector->MagiaAetherCharge, "Current magia aether charge"),
+                SummaryRow("PublicContentEureka.ElementalWheel", eurekaDirector == null ? "Unavailable" : $"Fire:{eurekaDirector->Fire} Ice:{eurekaDirector->Ice} Wind:{eurekaDirector->Wind} Earth:{eurekaDirector->Earth} Lightning:{eurekaDirector->Lightning} Water:{eurekaDirector->Water}", eurekaDirector == null ? string.Empty : $"{eurekaDirector->Fire},{eurekaDirector->Ice},{eurekaDirector->Wind},{eurekaDirector->Earth},{eurekaDirector->Lightning},{eurekaDirector->Water}", "Current magia board elemental allocation"),
+                SummaryRow("PublicContentEureka.Magicite", eurekaDirector == null ? 0 : eurekaDirector->Magicite, eurekaDirector == null ? 0 : eurekaDirector->Magicite, "Unlocked magicite count"),
+                SummaryRow("PublicContentEureka.MagiaAether", eurekaDirector == null ? 0 : eurekaDirector->MagiaAether, eurekaDirector == null ? 0 : eurekaDirector->MagiaAether, "Magia aether value")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadBozjaStatus(ClientStructsSheetDefinition definition)
+    {
+        var bozja = PublicContentBozja.GetInstance();
+        if (bozja == null)
+            return CreateEmptySnapshot(definition, "PublicContentBozja is not active.");
+
+        var container = &bozja->DynamicEventContainer;
+        InstanceDynamicEvent* currentEvent = null;
+        try { currentEvent = container->GetCurrentEvent(); } catch { }
+
+        var holsterCount = 0;
+        foreach (var actionId in bozja->State.HolsterActions)
+        {
+            if (actionId != 0)
+                holsterCount++;
+        }
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Pointer: {FormatPointer(bozja)}",
+            "PublicContentBozja snapshot.",
+            new[]
+            {
+                SummaryRow("Pointer", FormatPointer(bozja), ((nint)bozja).ToString("X", CultureInfo.InvariantCulture), "PublicContentBozja pointer"),
+                SummaryRow("StateInitialized", bozja->StateInitialized, bozja->StateInitialized, "Whether the Bozja state block is initialized"),
+                SummaryRow("CurrentExperience", bozja->State.CurrentExperience, bozja->State.CurrentExperience, "Current Bozja mettle"),
+                SummaryRow("NeededExperience", bozja->State.NeededExperience, bozja->State.NeededExperience, "Mettle needed for the next rank"),
+                SummaryRow("HolsterActionsLoaded", holsterCount, holsterCount, "Number of non-zero holster action ids"),
+                SummaryRow("DynamicEvent.CurrentEventId", container->CurrentEventId, container->CurrentEventId, "Current Bozja dynamic-event id"),
+                SummaryRow("DynamicEvent.CurrentEventIndex", container->CurrentEventIndex, container->CurrentEventIndex, "Current dynamic-event slot index"),
+                SummaryRow("CurrentDynamicEvent", currentEvent == null ? "<none>" : currentEvent->Name.ToString(), currentEvent == null ? string.Empty : currentEvent->Name.ToString(), "Current dynamic-event runtime name"),
+                SummaryRow("CurrentDynamicEventState", currentEvent == null ? "<none>" : FormatEnumValue(currentEvent->State), currentEvent == null ? 0 : (byte)currentEvent->State, "Current dynamic-event runtime state"),
+                SummaryRow("CurrentDynamicEventSecondsLeft", currentEvent == null ? 0 : currentEvent->SecondsLeft, currentEvent == null ? 0 : currentEvent->SecondsLeft, "Seconds left on the current Bozja dynamic event")
             });
     }
 
@@ -484,6 +1362,154 @@ public sealed unsafe class ClientStructsSheetService
             });
     }
 
+    private ClientStructsSheetSnapshot ReadAgentMap(ClientStructsSheetDefinition definition)
+    {
+        var agentMap = TryGetAgentMap();
+        if (agentMap == null)
+            return CreateEmptySnapshot(definition, "AgentMap is not loaded.");
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Pointer: {FormatPointer(agentMap)}",
+            "AgentMap summary snapshot.",
+            new[]
+            {
+                SummaryRow("Pointer", FormatPointer(agentMap), ((nint)agentMap).ToString("X", CultureInfo.InvariantCulture), "AgentMap pointer"),
+                SummaryRow("AddonId", agentMap->AddonId, agentMap->AddonId, "Backing addon id for the map agent"),
+                SummaryRow("CurrentTerritoryId", ResolveTerritoryName(agentMap->CurrentTerritoryId), agentMap->CurrentTerritoryId, "Current territory tracked by AgentMap"),
+                SummaryRow("CurrentMapId", agentMap->CurrentMapId, agentMap->CurrentMapId, "Current map id tracked by AgentMap"),
+                SummaryRow("SelectedTerritoryId", ResolveTerritoryName(agentMap->SelectedTerritoryId), agentMap->SelectedTerritoryId, "Selected territory tracked by AgentMap"),
+                SummaryRow("SelectedMapId", agentMap->SelectedMapId, agentMap->SelectedMapId, "Selected map id tracked by AgentMap"),
+                SummaryRow("MapTitleString", agentMap->MapTitleString.ToString(), agentMap->MapTitleString.ToString(), "Displayed map title"),
+                SummaryRow("CurrentMapPath", agentMap->CurrentMapPath.ToString(), agentMap->CurrentMapPath.ToString(), "Current map texture path"),
+                SummaryRow("CurrentMapBgPath", agentMap->CurrentMapBgPath.ToString(), agentMap->CurrentMapBgPath.ToString(), "Current map background texture path"),
+                SummaryRow("SelectedMapPath", agentMap->SelectedMapPath.ToString(), agentMap->SelectedMapPath.ToString(), "Selected map texture path"),
+                SummaryRow("SelectedMapBgPath", agentMap->SelectedMapBgPath.ToString(), agentMap->SelectedMapBgPath.ToString(), "Selected map background texture path"),
+                SummaryRow("CurrentMapSizeFactorFloat", agentMap->CurrentMapSizeFactorFloat.ToString("F3", CultureInfo.InvariantCulture), agentMap->CurrentMapSizeFactorFloat, "Current map size factor"),
+                SummaryRow("SelectedMapSizeFactorFloat", agentMap->SelectedMapSizeFactorFloat.ToString("F3", CultureInfo.InvariantCulture), agentMap->SelectedMapSizeFactorFloat, "Selected map size factor"),
+                SummaryRow("CurrentOffset", $"{agentMap->CurrentOffsetX}, {agentMap->CurrentOffsetY}", $"{agentMap->CurrentOffsetX},{agentMap->CurrentOffsetY}", "Current map x/y offset"),
+                SummaryRow("SelectedOffset", $"{agentMap->SelectedOffsetX}, {agentMap->SelectedOffsetY}", $"{agentMap->SelectedOffsetX},{agentMap->SelectedOffsetY}", "Selected map x/y offset"),
+                SummaryRow("CurrentMapMarkerRange", agentMap->CurrentMapMarkerRange, agentMap->CurrentMapMarkerRange, "Current map marker range"),
+                SummaryRow("SelectedMapMarkerRange", agentMap->SelectedMapMarkerRange, agentMap->SelectedMapMarkerRange, "Selected map marker range"),
+                SummaryRow("MapMarkerCount", agentMap->MapMarkerCount, agentMap->MapMarkerCount, "Active map-marker count"),
+                SummaryRow("EventMarkerCount", agentMap->EventMarkers.Count, agentMap->EventMarkers.Count, "Dynamic event/FATE/runtime event-marker count"),
+                SummaryRow("TempMapMarkerCount", agentMap->TempMapMarkerCount, agentMap->TempMapMarkerCount, "Temporary map-marker count"),
+                SummaryRow("FlagMarkerCount", agentMap->FlagMarkerCount, agentMap->FlagMarkerCount, "Flag-marker count"),
+                SummaryRow("MiniMapMarkerCount", agentMap->MiniMapMarkerCount, agentMap->MiniMapMarkerCount, "Minimap marker count"),
+                SummaryRow("MapQuestLinkContainer.MarkerCount", agentMap->MapQuestLinkContainer.MarkerCount, agentMap->MapQuestLinkContainer.MarkerCount, "Quest-link markers attached to the main map"),
+                SummaryRow("MiniMapQuestLinkContainer.MarkerCount", agentMap->MiniMapQuestLinkContainer.MarkerCount, agentMap->MiniMapQuestLinkContainer.MarkerCount, "Quest-link markers attached to the minimap"),
+                SummaryRow("CurrentOpenMapInfo.Type", FormatEnumValue(agentMap->CurrentOpenMapInfo.Type), (uint)agentMap->CurrentOpenMapInfo.Type, "Current open-map type"),
+                SummaryRow("CurrentOpenMapInfo.AddonId", agentMap->CurrentOpenMapInfo.AddonId, agentMap->CurrentOpenMapInfo.AddonId, "Current open-map addon id"),
+                SummaryRow("CurrentOpenMapInfo.TerritoryId", ResolveTerritoryName(agentMap->CurrentOpenMapInfo.TerritoryId), agentMap->CurrentOpenMapInfo.TerritoryId, "Territory attached to the current open-map context"),
+                SummaryRow("CurrentOpenMapInfo.MapId", agentMap->CurrentOpenMapInfo.MapId, agentMap->CurrentOpenMapInfo.MapId, "Map id attached to the current open-map context"),
+                SummaryRow("CurrentOpenMapInfo.PlaceNameId", agentMap->CurrentOpenMapInfo.PlaceNameId, agentMap->CurrentOpenMapInfo.PlaceNameId, "PlaceName row id attached to the current open-map context"),
+                SummaryRow("CurrentOpenMapInfo.FateId", agentMap->CurrentOpenMapInfo.FateId, agentMap->CurrentOpenMapInfo.FateId, "FATE id attached to the current open-map context"),
+                SummaryRow("CurrentOpenMapInfo.QuestId", agentMap->CurrentOpenMapInfo.QuestId, agentMap->CurrentOpenMapInfo.QuestId, "Quest id attached to the current open-map context"),
+                SummaryRow("IsPlayerMoving", agentMap->IsPlayerMoving, agentMap->IsPlayerMoving, "AgentMap movement flag"),
+                SummaryRow("IsControlKeyPressed", agentMap->IsControlKeyPressed, agentMap->IsControlKeyPressed, "AgentMap control-key flag")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadMapMarkers(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
+    {
+        var agentModule = AgentModule.Instance();
+        if (agentModule == null)
+            return CreateEmptySnapshot(definition, "AgentModule.Instance() returned null.");
+
+        var agentMap = (AgentMap*)agentModule->GetAgentByInternalId(AgentId.Map);
+        if (agentMap == null)
+            return CreateEmptySnapshot(definition, "AgentMap is not loaded.");
+
+        var markers = agentMap->MapMarkers;
+        var totalRows = Math.Min((int)agentMap->MapMarkerCount, markers.Length);
+        var columns = CreateColumns(
+            Column("Idx", "Index", "Map-marker array index", 56f),
+            Column("IconId", "uint", "Primary icon id", 84f),
+            Column("SecondaryIconId", "uint", "Secondary icon id", 108f),
+            Column("Scale", "int", "Marker scale", 72f),
+            Column("X", "short", "Raw map X", 64f),
+            Column("Y", "short", "Raw map Y", 64f),
+            Column("DataType", "ushort", "Marker data type", 82f),
+            Column("DataKey", "ushort", "Marker data key", 82f),
+            Column("SubKey", "byte", "Marker subkey", 72f),
+            Column("Subtext", "CStringPointer", "Marker subtext when present", 220f));
+
+        var visibleRows = new List<ClientStructsSheetRow>();
+        BuildWindow(totalRows, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
+        for (var offset = 0; offset < rowsToLoad; offset++)
+        {
+            var rowIndex = startIndex + offset;
+            var marker = markers[rowIndex];
+            visibleRows.Add(CreateRow(
+                rowIndex,
+                (uint)rowIndex,
+                Cell(rowIndex),
+                Cell(marker.MapMarker.IconId),
+                Cell(marker.MapMarker.SecondaryIconId),
+                Cell(marker.MapMarker.Scale),
+                Cell(marker.MapMarker.X),
+                Cell(marker.MapMarker.Y),
+                Cell(marker.DataType),
+                Cell(marker.DataKey),
+                Cell(marker.MapMarkerSubKey),
+                Cell(ReadCStringPointer(marker.MapMarker.Subtext), ReadCStringPointer(marker.MapMarker.Subtext))));
+        }
+
+        var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {totalRows} - AgentMap active map markers";
+        return CreateSnapshot(definition, columns, visibleRows, totalRows, startIndex, request.RowCount, $"Pointer: {FormatPointer(agentMap)}", message);
+    }
+
+    private ClientStructsSheetSnapshot ReadEventMarkers(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
+    {
+        var agentModule = AgentModule.Instance();
+        if (agentModule == null)
+            return CreateEmptySnapshot(definition, "AgentModule.Instance() returned null.");
+
+        var agentMap = (AgentMap*)agentModule->GetAgentByInternalId(AgentId.Map);
+        if (agentMap == null)
+            return CreateEmptySnapshot(definition, "AgentMap is not loaded.");
+
+        var markers = agentMap->EventMarkers;
+        var totalRows = markers.Count;
+        var columns = CreateColumns(
+            Column("Idx", "Index", "Event-marker vector index", 56f),
+            Column("IconId", "uint", "Marker icon id", 84f),
+            Column("ObjectiveId", "uint", "Objective id", 92f),
+            Column("RecommendedLevel", "ushort", "Recommended level", 110f),
+            Column("MapId", "uint", "Map id", 84f),
+            Column("Territory", "ushort", "TerritoryType row id", 180f),
+            Column("MarkerType", "byte", "Marker type", 76f),
+            Column("EventState", "sbyte", "Runtime event state", 76f),
+            Column("Position", "Vector3", "World position", 180f),
+            Column("Radius", "float", "Marker radius", 76f),
+            Column("Tooltip", "Utf8String", "Tooltip text when present", 260f));
+
+        var visibleRows = new List<ClientStructsSheetRow>();
+        BuildWindow(totalRows, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
+        for (var offset = 0; offset < rowsToLoad; offset++)
+        {
+            var rowIndex = startIndex + offset;
+            var marker = markers[rowIndex];
+            visibleRows.Add(CreateRow(
+                rowIndex,
+                marker.ObjectiveId,
+                Cell(rowIndex),
+                Cell(marker.IconId),
+                Cell(marker.ObjectiveId),
+                Cell(marker.RecommendedLevel),
+                Cell(marker.MapId),
+                Cell(ResolveTerritoryName(marker.TerritoryTypeId), marker.TerritoryTypeId),
+                Cell(marker.MarkerType),
+                Cell(marker.EventState),
+                Cell(FormatVector3(marker.Position), FormatVector3(marker.Position)),
+                Cell(marker.Radius.ToString("F1", CultureInfo.InvariantCulture), marker.Radius),
+                Cell(ReadUtf8String(marker.TooltipString), ReadUtf8String(marker.TooltipString))));
+        }
+
+        var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {totalRows} - AgentMap event markers";
+        return CreateSnapshot(definition, columns, visibleRows, totalRows, startIndex, request.RowCount, $"Pointer: {FormatPointer(agentMap)}", message);
+    }
+
     private ClientStructsSheetSnapshot ReadInfoModule(ClientStructsSheetDefinition definition)
     {
         var infoModule = InfoModule.Instance();
@@ -715,6 +1741,205 @@ public sealed unsafe class ClientStructsSheetService
             });
     }
 
+    private ClientStructsSheetSnapshot ReadFateSummary(ClientStructsSheetDefinition definition)
+    {
+        var fateManager = FateManager.Instance();
+        if (fateManager == null)
+            return CreateEmptySnapshot(definition, "FateManager.Instance() returned null.");
+
+        ushort currentFateId = 0;
+        try { currentFateId = fateManager->GetCurrentFateId(); } catch { }
+
+        var currentFate = fateManager->CurrentFate;
+        var fateDirector = fateManager->FateDirector;
+        var agentModule = AgentModule.Instance();
+        var agentFateProgress = agentModule == null ? null : (AgentFateProgress*)agentModule->GetAgentByInternalId(AgentId.FateProgress);
+
+        var isSyncedToCurrent = false;
+        try
+        {
+            isSyncedToCurrent = currentFate != null && fateManager->IsSyncedToFate(currentFate);
+        }
+        catch
+        {
+        }
+
+        return CreateSummarySnapshot(
+            definition,
+            $"Pointer: {FormatPointer(fateManager)}",
+            "FateManager summary snapshot.",
+            new[]
+            {
+                SummaryRow("Pointer", FormatPointer(fateManager), ((nint)fateManager).ToString("X", CultureInfo.InvariantCulture), "FateManager singleton address"),
+                SummaryRow("Fates.Count", fateManager->Fates.Count, fateManager->Fates.Count, "Number of active FateContext pointers"),
+                SummaryRow("FateJoined", fateManager->FateJoined, fateManager->FateJoined, "Joined/current fate flag"),
+                SummaryRow("SyncedFateId", fateManager->SyncedFateId, fateManager->SyncedFateId, "Currently synced fate id"),
+                SummaryRow("GetCurrentFateId()", currentFateId, currentFateId, "Current fate id helper"),
+                SummaryRow("CurrentFate.Pointer", FormatPointer(currentFate), currentFate == null ? "0" : ((nint)currentFate).ToString("X", CultureInfo.InvariantCulture), "Current FateContext pointer"),
+                SummaryRow("CurrentFate.Name", currentFate == null ? string.Empty : currentFate->Name.ToString(), currentFate == null ? string.Empty : currentFate->Name.ToString(), "Current fate name"),
+                SummaryRow("CurrentFate.State", currentFate == null ? "<none>" : FormatEnumValue(currentFate->State), currentFate == null ? 0 : (byte)currentFate->State, "Current fate runtime state"),
+                SummaryRow("CurrentFate.Progress", currentFate == null ? 0 : currentFate->Progress, currentFate == null ? 0 : currentFate->Progress, "Current fate progress"),
+                SummaryRow("CurrentFate.Level", currentFate == null ? 0 : currentFate->Level, currentFate == null ? 0 : currentFate->Level, "Current fate level"),
+                SummaryRow("CurrentFate.Bonus", currentFate != null && currentFate->IsBonus, currentFate != null && currentFate->IsBonus, "Bonus-fate flag"),
+                SummaryRow("CurrentFate.Eureka", currentFate != null && currentFate->EurekaFate != 0, currentFate != null && currentFate->EurekaFate != 0, "Eureka-fate flag"),
+                SummaryRow("CurrentFate.Location", currentFate == null ? string.Empty : FormatVector3(currentFate->Location), currentFate == null ? string.Empty : FormatVector3(currentFate->Location), "Current fate center position"),
+                SummaryRow("CurrentFate.Radius", currentFate == null ? "0" : currentFate->Radius.ToString("F1", CultureInfo.InvariantCulture), currentFate == null ? 0 : currentFate->Radius, "Current fate radius"),
+                SummaryRow("IsSyncedToCurrentFate", isSyncedToCurrent, isSyncedToCurrent, "Whether the local player is currently synced to the active fate"),
+                SummaryRow("FateDirector.Pointer", FormatPointer(fateDirector), fateDirector == null ? "0" : ((nint)fateDirector).ToString("X", CultureInfo.InvariantCulture), "FateDirector pointer"),
+                SummaryRow("FateDirector.FateId", fateDirector == null ? 0 : fateDirector->FateId, fateDirector == null ? 0 : fateDirector->FateId, "FateDirector fate id"),
+                SummaryRow("FateDirector.FateLevel", fateDirector == null ? 0 : fateDirector->FateLevel, fateDirector == null ? 0 : fateDirector->FateLevel, "FateDirector fate level"),
+                SummaryRow("FateDirector.FateNpcObjectId", fateDirector == null ? 0 : fateDirector->FateNpcObjectId, fateDirector == null ? 0 : fateDirector->FateNpcObjectId, "FateDirector NPC object id"),
+                SummaryRow("AgentFateProgress.TabIndex", agentFateProgress == null ? 0 : agentFateProgress->TabIndex, agentFateProgress == null ? 0 : agentFateProgress->TabIndex, "Selected shared-fate tab when the Fate Progress agent is loaded")
+            });
+    }
+
+    private ClientStructsSheetSnapshot ReadActiveFates(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
+    {
+        var fateManager = FateManager.Instance();
+        if (fateManager == null)
+            return CreateEmptySnapshot(definition, "FateManager.Instance() returned null.");
+
+        var activeFates = new List<(int VectorIndex, nint FatePointer)>();
+        for (var i = 0; i < fateManager->Fates.Count; i++)
+        {
+            var fate = fateManager->Fates[i].Value;
+            if (fate == null || fate->FateId == 0)
+                continue;
+
+            activeFates.Add((i, (nint)fate));
+        }
+
+        var columns = CreateColumns(
+            Column("VecIdx", "Index", "FateManager.Fates vector index", 62f),
+            Column("FateId", "ushort", "FATE id", 76f),
+            Column("State", "enum", "FATE runtime state", 110f),
+            Column("Name", "Utf8String", "Runtime fate name", 220f),
+            Column("Level", "byte", "FATE level", 64f),
+            Column("MaxLevel", "byte", "Maximum sync level", 76f),
+            Column("Progress", "byte", "Progress percentage", 72f),
+            Column("Bonus", "bool", "Bonus-fate flag", 64f),
+            Column("Eureka", "bool", "Eureka-fate flag", 70f),
+            Column("StartTime", "int", "FATE start timestamp", 150f),
+            Column("DurationMin", "short", "FATE duration in minutes", 90f),
+            Column("RequiredQuest", "Quest", "Required quest row id", 180f),
+            Column("Location", "Vector3", "FATE center position", 180f),
+            Column("Radius", "float", "FATE radius", 76f));
+
+        var visibleRows = new List<ClientStructsSheetRow>();
+        BuildWindow(activeFates.Count, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
+        for (var offset = 0; offset < rowsToLoad; offset++)
+        {
+            var rowIndex = startIndex + offset;
+            var entry = activeFates[rowIndex];
+            var fate = (FateContext*)entry.FatePointer;
+            visibleRows.Add(CreateRow(
+                rowIndex,
+                fate->FateId,
+                Cell(entry.VectorIndex),
+                Cell(fate->FateId),
+                Cell(FormatEnumValue(fate->State), (byte)fate->State),
+                Cell(fate->Name.ToString(), fate->Name.ToString()),
+                Cell(fate->Level),
+                Cell(fate->MaxLevel),
+                Cell(fate->Progress),
+                Cell(fate->IsBonus),
+                Cell(fate->EurekaFate != 0),
+                Cell(FormatUnixTimestamp(fate->StartTimeEpoch), fate->StartTimeEpoch),
+                Cell(fate->Duration),
+                Cell(ResolveQuestRowName(fate->RequiredQuest), fate->RequiredQuest),
+                Cell(FormatVector3(fate->Location), FormatVector3(fate->Location)),
+                Cell(fate->Radius.ToString("F1", CultureInfo.InvariantCulture), fate->Radius)));
+        }
+
+        var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {activeFates.Count} - Active FATE contexts";
+        return CreateSnapshot(definition, columns, visibleRows, activeFates.Count, startIndex, request.RowCount, $"Pointer: {FormatPointer(fateManager)}", message);
+    }
+
+    private ClientStructsSheetSnapshot ReadPartyMembers(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
+    {
+        var groupManager = GroupManager.Instance();
+        if (groupManager == null)
+            return CreateEmptySnapshot(definition, "GroupManager.Instance() returned null.");
+
+        var group = groupManager->GetGroup();
+        if (group == null)
+            return CreateEmptySnapshot(definition, "GroupManager has no active group.");
+
+        var members = new List<(int Slot, bool AllianceEntry, nint MemberPointer)>();
+        if (group->IsAlliance)
+        {
+            for (var i = 0; i < 20; i++)
+            {
+                var member = group->GetAllianceMemberByIndex(i);
+                if (member == null || member->ContentId == 0)
+                    continue;
+
+                members.Add((i, true, (nint)member));
+            }
+        }
+        else
+        {
+            for (var i = 0; i < 8; i++)
+            {
+                var member = group->GetPartyMemberByIndex(i);
+                if (member == null || member->ContentId == 0)
+                    continue;
+
+                members.Add((i, false, (nint)member));
+            }
+        }
+
+        var columns = CreateColumns(
+            Column("Slot", "Index", "Party/alliance slot index", 56f),
+            Column("Alliance", "bool", "True when the row came from alliance indexing", 72f),
+            Column("ContentId", "ulong", "Character content id", 140f),
+            Column("EntityId", "uint", "Character entity id", 110f),
+            Column("Name", "string", "Party-member display name", 180f),
+            Column("HomeWorld", "ushort", "Home world row id", 140f),
+            Column("Territory", "ushort", "Current territory row id", 180f),
+            Column("ClassJob", "byte", "Current class/job id", 120f),
+            Column("Level", "byte", "Current level", 64f),
+            Column("HP", "uint", "Current and max HP", 110f),
+            Column("MP", "ushort", "Current and max MP", 110f),
+            Column("Position", "Vector3", "Current world position", 180f),
+            Column("Flags", "byte", "Raw party-member flags byte", 72f),
+            Column("Cv2", "uint", "Content value key 2", 72f),
+            Column("Cv3", "uint", "Content value key 3", 72f),
+            Column("Cv4", "uint", "Content value key 4", 72f));
+
+        var visibleRows = new List<ClientStructsSheetRow>();
+        BuildWindow(members.Count, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
+        for (var offset = 0; offset < rowsToLoad; offset++)
+        {
+            var rowIndex = startIndex + offset;
+            var entry = members[rowIndex];
+            var member = (PartyMember*)entry.MemberPointer;
+            var name = member->NameOverride != null ? member->NameOverride->ToString() : member->NameString;
+            visibleRows.Add(CreateRow(
+                rowIndex,
+                (uint)entry.Slot,
+                Cell(entry.Slot),
+                Cell(entry.AllianceEntry),
+                Cell(member->ContentId),
+                Cell(member->EntityId),
+                Cell(name, member->ContentId),
+                Cell(ResolveWorldName(member->HomeWorld), member->HomeWorld),
+                Cell(ResolveTerritoryName(member->TerritoryType), member->TerritoryType),
+                Cell(ResolveClassJobName(member->ClassJob), member->ClassJob),
+                Cell(member->Level),
+                Cell($"{member->CurrentHP}/{member->MaxHP}", $"{member->CurrentHP}/{member->MaxHP}"),
+                Cell($"{member->CurrentMP}/{member->MaxMP}", $"{member->CurrentMP}/{member->MaxMP}"),
+                Cell(FormatVector3(member->Position), FormatVector3(member->Position)),
+                Cell(member->Flags),
+                Cell(member->GetContentValue(2)),
+                Cell(member->GetContentValue(3)),
+                Cell(member->GetContentValue(4))));
+        }
+
+        var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {members.Count} - MemberCount: {group->MemberCount} - PartyLeaderIndex: {group->PartyLeaderIndex} - IsAlliance: {group->IsAlliance} - IsSmallGroupAlliance: {group->IsSmallGroupAlliance}";
+        return CreateSnapshot(definition, columns, visibleRows, members.Count, startIndex, request.RowCount, $"Pointer: {FormatPointer(group)}", message);
+    }
+
     private ClientStructsSheetSnapshot ReadActionManager(ClientStructsSheetDefinition definition)
     {
         var actionManager = ActionManager.Instance();
@@ -790,8 +2015,8 @@ public sealed unsafe class ClientStructsSheetService
             Column("Materia", "byte", "Materia count", 70f),
             Column("Durability", "ushort", "Item durability", 90f),
             Column("Spiritbond", "ushort", "Item spiritbond", 90f),
-            Column("SellingRetainerCid", "ulong", "Selling retainer content id", 140f),
-            Column("SellingPlayerCid", "ulong", "Selling player content id", 140f));
+            Column("RetainerId", "ulong", "Selling retainer id", 140f),
+            Column("ContentId", "ulong", "Seller/player content id", 140f));
 
     private List<ClientStructsSheetRow> BuildMarketListingRows(Span<MarketBoardListing> listings, int totalRows, int requestedStartIndex, int requestedRowCount)
     {
@@ -817,8 +2042,8 @@ public sealed unsafe class ClientStructsSheetService
                 Cell(entry.MateriaCount),
                 Cell(entry.Durability),
                 Cell(entry.Spiritbond),
-                Cell(entry.SellingRetainerContentId),
-                Cell(entry.SellingPlayerContentId)));
+                Cell(entry.RetainerId),
+                Cell(entry.ContentId)));
         }
 
         return visibleRows;
@@ -881,6 +2106,50 @@ public sealed unsafe class ClientStructsSheetService
             VisibleRowsCopyText = string.Empty
         };
 
+    private static string ResolveTerritoryName(uint territoryId)
+    {
+        if (territoryId == 0)
+            return "0";
+
+        try
+        {
+            var sheet = Plugin.DataManager.GetExcelSheet<TerritoryType>();
+            if (sheet == null || !sheet.TryGetRow(territoryId, out var row))
+                return territoryId.ToString(CultureInfo.InvariantCulture);
+
+            var placeName = row.PlaceName.ValueNullable?.Name.ToString()?.Trim() ?? string.Empty;
+            return string.IsNullOrWhiteSpace(placeName)
+                ? territoryId.ToString(CultureInfo.InvariantCulture)
+                : $"{territoryId} - {placeName}";
+        }
+        catch
+        {
+            return territoryId.ToString(CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static string ResolveContentFinderConditionName(ushort contentId)
+    {
+        if (contentId == 0)
+            return "0";
+
+        try
+        {
+            var sheet = Plugin.DataManager.GetExcelSheet<ContentFinderCondition>();
+            if (sheet == null || !sheet.TryGetRow(contentId, out var row))
+                return contentId.ToString(CultureInfo.InvariantCulture);
+
+            var name = row.Name.ToString().Trim();
+            return string.IsNullOrWhiteSpace(name)
+                ? contentId.ToString(CultureInfo.InvariantCulture)
+                : $"{contentId} - {name}";
+        }
+        catch
+        {
+            return contentId.ToString(CultureInfo.InvariantCulture);
+        }
+    }
+
     private static void BuildWindow(int totalRows, int requestedStartIndex, int requestedRowCount, out int startIndex, out int rowsToLoad)
     {
         var clampedRowCount = Math.Clamp(requestedRowCount, 5, 100);
@@ -941,6 +2210,98 @@ public sealed unsafe class ClientStructsSheetService
 
     private static ClientStructsSummaryRow SummaryRow(string field, object? value, object? raw, string notes)
         => new(field, Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty, Convert.ToString(raw, CultureInfo.InvariantCulture) ?? string.Empty, notes);
+
+    private static uint ResolvePreferredInstanceCandidate(
+        uint publicInstanceId,
+        short proxyCurrentInstance,
+        short networkCurrentInstance,
+        uint dalamudClientStateInstance,
+        ZoneInstanceSnapshot zoneInit,
+        ContentsReplayManager* replayManager,
+        bool hasReplayZoneInit,
+        out string source)
+    {
+        if (publicInstanceId != 0)
+        {
+            source = "UIState.PublicInstance.InstanceId";
+            return publicInstanceId;
+        }
+
+        if (proxyCurrentInstance > 0)
+        {
+            source = "NetworkModuleProxy.GetCurrentInstance()";
+            return (uint)proxyCurrentInstance;
+        }
+
+        if (networkCurrentInstance > 0)
+        {
+            source = "NetworkModule.CurrentInstance";
+            return (uint)networkCurrentInstance;
+        }
+
+        if (dalamudClientStateInstance != 0)
+        {
+            source = "Dalamud.ClientState.Instance";
+            return dalamudClientStateInstance;
+        }
+
+        if (zoneInit.HasCapturedPacket && zoneInit.PacketInstance != 0)
+        {
+            source = "LastZoneInit.PacketInstance";
+            return zoneInit.PacketInstance;
+        }
+
+        if (hasReplayZoneInit && replayManager != null && replayManager->ZoneInitPacket.Instance != 0)
+        {
+            source = "ReplayZoneInit.Instance";
+            return replayManager->ZoneInitPacket.Instance;
+        }
+
+        source = "None";
+        return 0;
+    }
+
+    private static ushort ResolvePreferredServerIdCandidate(ZoneInstanceSnapshot zoneInit, ContentsReplayManager* replayManager, bool hasReplayZoneInit, out string source)
+    {
+        if (zoneInit.HasCapturedPacket && zoneInit.ServerId != 0)
+        {
+            source = "LastZoneInit.ServerId";
+            return zoneInit.ServerId;
+        }
+
+        if (hasReplayZoneInit && replayManager != null && replayManager->ZoneInitPacket.ServerId != 0)
+        {
+            source = "ReplayZoneInit.ServerId";
+            return replayManager->ZoneInitPacket.ServerId;
+        }
+
+        source = "None";
+        return 0;
+    }
+
+    private static uint ResolvePreferredPopRangeCandidate(ZoneInstanceSnapshot zoneInit, ContentsReplayManager* replayManager, bool hasReplayZoneInit, PublicContentDirector* publicContentDirector, out string source)
+    {
+        if (zoneInit.HasCapturedPacket && zoneInit.PopRangeId != 0)
+        {
+            source = "LastZoneInit.PopRangeId";
+            return zoneInit.PopRangeId;
+        }
+
+        if (hasReplayZoneInit && replayManager != null && replayManager->ZoneInitPacket.PopRangeId != 0)
+        {
+            source = "ReplayZoneInit.PopRangeId";
+            return replayManager->ZoneInitPacket.PopRangeId;
+        }
+
+        if (publicContentDirector != null && publicContentDirector->LGBPopRange != 0)
+        {
+            source = "PublicContent.LGBPopRange";
+            return publicContentDirector->LGBPopRange;
+        }
+
+        source = "None";
+        return 0;
+    }
 
     private static string BuildVisibleRowsCopyText(IReadOnlyList<ClientStructsSheetColumn> columns, IReadOnlyList<ClientStructsSheetRow> rows)
     {
@@ -1013,6 +2374,31 @@ public sealed unsafe class ClientStructsSheetService
     private static string FormatOptionalIndex(int? value)
         => value.HasValue ? value.Value.ToString(CultureInfo.InvariantCulture) : "<unavailable>";
 
+    private static string FormatEnumValue<TEnum>(TEnum value) where TEnum : struct, Enum
+    {
+        var raw = Convert.ToUInt64(value, CultureInfo.InvariantCulture);
+        return Enum.IsDefined(value)
+            ? $"{raw} ({value})"
+            : raw.ToString(CultureInfo.InvariantCulture);
+    }
+
+    private static string FormatTerritoryIntendedUse(ClientTerritoryIntendedUse value)
+        => FormatEnumValue(value);
+
+    private static string FormatContentType(EventContentType value)
+        => FormatEnumValue(value);
+
+    private static string FormatPublicContentDirectorType(PublicContentDirectorType value)
+        => FormatEnumValue(value);
+
+    private static string FormatZoneInitFlags(ZoneInitFlags value)
+    {
+        var raw = (ushort)value;
+        return raw == 0
+            ? "0 (None)"
+            : $"{raw} ({value})";
+    }
+
     private static string FormatCrossWorldLinkshellMembershipType(ushort membershipType)
         => membershipType switch
         {
@@ -1049,6 +2435,36 @@ public sealed unsafe class ClientStructsSheetService
             ? "0"
             : $"{houseId.Id} => Territory:{houseId.TerritoryTypeId}, World:{houseId.WorldId}, Ward:{houseId.WardIndex}, Plot:{houseId.PlotIndex}, Room:{houseId.RoomNumber}, Apartment:{houseId.IsApartment}";
 
+    private static string FormatVector3(System.Numerics.Vector3 value)
+        => $"{value.X:F1}, {value.Y:F1}, {value.Z:F1}";
+
+    private static string ReadUtf8String(Utf8String* value)
+    {
+        if (value == null)
+            return string.Empty;
+
+        try
+        {
+            return value->ToString() ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string ReadCStringPointer(CStringPointer value)
+    {
+        try
+        {
+            return value.ToString() ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
     private static string ResolveItemName(uint itemId)
     {
         if (itemId == 0)
@@ -1064,6 +2480,24 @@ public sealed unsafe class ClientStructsSheetService
         catch
         {
             return itemId.ToString(CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static string ResolveWeatherName(byte weatherId)
+    {
+        if (weatherId == 0)
+            return "0";
+
+        try
+        {
+            var sheet = Plugin.DataManager.GetExcelSheet<Weather>();
+            return sheet != null && sheet.TryGetRow(weatherId, out var row)
+                ? $"{weatherId} - {row.Name}"
+                : weatherId.ToString(CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return weatherId.ToString(CultureInfo.InvariantCulture);
         }
     }
 
@@ -1104,6 +2538,24 @@ public sealed unsafe class ClientStructsSheetService
         }
     }
 
+    private static string ResolveQuestRowName(uint questRowId)
+    {
+        if (questRowId == 0)
+            return "0";
+
+        try
+        {
+            var sheet = Plugin.DataManager.GetExcelSheet<Quest>();
+            return sheet != null && sheet.TryGetRow(questRowId, out var row)
+                ? $"{questRowId} - {row.Name}"
+                : questRowId.ToString(CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return questRowId.ToString(CultureInfo.InvariantCulture);
+        }
+    }
+
     private static string ResolveWorldName(ushort worldId)
     {
         if (worldId == 0)
@@ -1121,6 +2573,39 @@ public sealed unsafe class ClientStructsSheetService
             return worldId.ToString(CultureInfo.InvariantCulture);
         }
     }
+
+    private static string ResolveContentRouletteName(uint rouletteId)
+    {
+        if (rouletteId == 0)
+            return "0";
+
+        try
+        {
+            var sheet = Plugin.DataManager.GetExcelSheet<LuminaContentRouletteSheet>();
+            return sheet != null && sheet.TryGetRow(rouletteId, out var row)
+                ? $"{rouletteId} - {row.Name}"
+                : rouletteId.ToString(CultureInfo.InvariantCulture);
+        }
+        catch
+        {
+            return rouletteId.ToString(CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static AgentMap* TryGetAgentMap()
+    {
+        var agentModule = AgentModule.Instance();
+        return agentModule == null ? null : (AgentMap*)agentModule->GetAgentByInternalId(AgentId.Map);
+    }
+
+    private static string ResolveQueueEntry(ContentsId entry)
+        => entry.ContentType switch
+        {
+            AgentContentsType.None => "None",
+            AgentContentsType.Regular => $"Regular - {ResolveContentFinderConditionName((ushort)entry.Id)}",
+            AgentContentsType.Roulette => $"Roulette - {ResolveContentRouletteName(entry.Id)}",
+            _ => $"{entry.ContentType} - Id={entry.Id}"
+        };
 }
 
 public sealed record ClientStructsSheetDefinition(
@@ -1172,6 +2657,20 @@ public sealed class ClientStructsSheetRow
     public int RowIndex { get; set; }
     public uint RowId { get; set; }
     public List<ClientStructsSheetCell> Cells { get; set; } = new();
+}
+
+public sealed class ClientStructsSearchResult
+{
+    public string SheetName { get; set; } = string.Empty;
+    public string Category { get; set; } = string.Empty;
+    public int RowIndex { get; set; } = -1;
+    public uint RowId { get; set; }
+    public int ColumnIndex { get; set; } = -1;
+    public string ColumnHeader { get; set; } = string.Empty;
+    public string MatchSource { get; set; } = string.Empty;
+    public string DisplayText { get; set; } = string.Empty;
+    public string RawText { get; set; } = string.Empty;
+    public string DetailText { get; set; } = string.Empty;
 }
 
 public sealed record ClientStructsSummaryRow(string Field, string Value, string Raw, string Notes);

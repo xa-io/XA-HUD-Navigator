@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
@@ -24,6 +25,7 @@ public class MainWindow : Window, IDisposable
 {
     private readonly Plugin plugin;
     private const string PluginVersion = BuildInfo.Version;
+    private static float UiScale => ImGuiHelpers.GlobalScale;
 
     // Cached addon scan results
     private List<AddonInfo> cachedAddons = new();
@@ -78,8 +80,16 @@ public class MainWindow : Window, IDisposable
     private InventoryType clientStructsInventoryType = InventoryType.Inventory1;
     private int clientStructsPreviewStartIndex;
     private int clientStructsPreviewRowCount = 20;
+    private string clientStructsValueFilter = string.Empty;
     private int selectedClientStructsPreviewRow = -1;
     private int selectedClientStructsPreviewColumn = -1;
+    private string clientStructsMasterSearchFilter = string.Empty;
+    private List<ClientStructsSearchResult> clientStructsMasterSearchResults = new();
+    private int selectedClientStructsMasterSearchResult = -1;
+    private string clientStructsMasterSearchStatus = "Enter at least 3 characters to search across all ClientStructs runtime views.";
+    private string clientStructsMasterSearchLastQuery = string.Empty;
+    private DateTime clientStructsMasterSearchLastRefresh = DateTime.MinValue;
+    private bool switchToClientStructsCommonView;
     private static readonly InventoryType[] ClientStructsInventoryTypes = Enum.GetValues<InventoryType>();
 
     // Copied feedback
@@ -89,12 +99,13 @@ public class MainWindow : Window, IDisposable
     public MainWindow(Plugin plugin)
         : base("XA HUD Navigator##XAHudNavigator", ImGuiWindowFlags.None)
     {
-        SizeConstraints = new WindowSizeConstraints
-        {
-            MinimumSize = new Vector2(800, 500),
-            MaximumSize = new Vector2(float.MaxValue, float.MaxValue)
-        };
         this.plugin = plugin;
+        UpdateSizeConstraints(ImGuiHelpers.GlobalScaleSafe);
+    }
+
+    public override void PreDraw()
+    {
+        UpdateSizeConstraints(UiScale);
     }
 
     public void Dispose()
@@ -104,6 +115,8 @@ public class MainWindow : Window, IDisposable
             Plugin.Framework.Update -= OnClickTrackTick;
             clickTrackFrameworkHooked = false;
         }
+
+        clientStructsSheetService.Dispose();
     }
 
     private void CopyAndNotify(string text, string label = "")
@@ -171,6 +184,18 @@ public class MainWindow : Window, IDisposable
         ImGui.Separator();
         DrawStatusBar();
     }
+
+    private void UpdateSizeConstraints(float scale)
+    {
+        SizeConstraints = new WindowSizeConstraints
+        {
+            MinimumSize = new Vector2(800f * scale, 500f * scale),
+            MaximumSize = new Vector2(float.MaxValue, float.MaxValue)
+        };
+    }
+
+    private static float Scale(float value)
+        => value * UiScale;
 
     // ═══════════════════════════════════════════════════
     //  Top Bar
@@ -290,11 +315,12 @@ public class MainWindow : Window, IDisposable
     private void DrawAddonsTab()
     {
         var avail = ImGui.GetContentRegionAvail();
-        var leftW = 200f;
-        var rightW = 260f;
-        var centerW = avail.X - leftW - rightW - 12;
-        if (centerW < 200) centerW = 200;
-        var panelH = avail.Y - 30;
+        var leftW = Scale(200f);
+        var rightW = Scale(260f);
+        var centerW = avail.X - leftW - rightW - Scale(12f);
+        if (centerW < Scale(200f))
+            centerW = Scale(200f);
+        var panelH = avail.Y - Scale(30f);
 
         // ── Left: Addon list ──
         using (var child = ImRaii.Child("AddonList", new Vector2(leftW, panelH), true))
@@ -549,6 +575,7 @@ public class MainWindow : Window, IDisposable
         }
 
         var n = addon.Nodes[selectedNodeIndex];
+        var runtimeReport = AddonInspector.BuildNodeRuntimeReport(addon.Name, n.Index);
 
         // ── Node Detail Section (~20 lines height) ──
         var lineH = ImGui.GetTextLineHeightWithSpacing();
@@ -608,6 +635,21 @@ public class MainWindow : Window, IDisposable
             if (!string.IsNullOrEmpty(n.Text))
                 details.Add($"Text: {n.Text}");
             CopyAndNotify(string.Join("\n", details), "All Details");
+        }
+
+        if (runtimeReport != null)
+        {
+            ImGui.SameLine();
+            if (ImGui.SmallButton("Copy Runtime Detail"))
+                CopyAndNotify(AddonInspector.BuildNodeRuntimeReportText(runtimeReport), "Runtime detail");
+        }
+
+        if (runtimeReport != null)
+        {
+            DrawCopyableLineSection("Selected Node Runtime", runtimeReport.SummaryLines, Scale(120f));
+            DrawCopyableLineSection($"Component Children [{runtimeReport.ComponentChildLines.Count}]", runtimeReport.ComponentChildLines, Scale(150f));
+            DrawCopyableLineSection($"TreeList Runtime [{runtimeReport.TreeListLines.Count}]", runtimeReport.TreeListLines, Scale(170f));
+            DrawCopyableLineSection($"TreeList Visible Renderers [{runtimeReport.TreeListRendererLines.Count}]", runtimeReport.TreeListRendererLines, Scale(180f));
         }
 
         ImGui.Spacing();
@@ -685,6 +727,30 @@ public class MainWindow : Window, IDisposable
             ImGui.SetTooltip("Click to copy");
     }
 
+    private void DrawCopyableLineSection(string header, List<string> lines, float height)
+    {
+        if (lines.Count == 0)
+            return;
+
+        ImGui.Spacing();
+        using var scopedId = ImRaii.PushId(header);
+        if (!ImGui.CollapsingHeader(header))
+            return;
+
+        if (ImGui.SmallButton("Copy Section"))
+            CopyAndNotify(string.Join("\n", lines), header);
+
+        using var child = ImRaii.Child($"{header}Child", new Vector2(-1, height), true);
+        if (!child.Success)
+            return;
+
+        for (var i = 0; i < lines.Count; i++)
+        {
+            if (ImGui.Selectable($"{lines[i]}##line{i}"))
+                CopyAndNotify(lines[i], header);
+        }
+    }
+
     // ═══════════════════════════════════════════════════
     //  Debug Tab — recursive addon dump
     // ═══════════════════════════════════════════════════
@@ -719,13 +785,13 @@ public class MainWindow : Window, IDisposable
             CopyAndNotify(BuildDebugReport(snapshot, snapshot.Entries), "Full debug dump");
         ImGui.SameLine();
         if (ImGui.SmallButton("Copy Filtered Dump"))
-            CopyAndNotify(BuildDebugReport(snapshot, filteredEntries), "Filtered debug dump");
+            CopyAndNotify(BuildDebugReport(snapshot, filteredEntries, debugFilter), "Filtered debug dump");
 
-        ImGui.TextDisabled("Recursive paths mirror the component-path style used by XA addon text readers.");
+        ImGui.TextDisabled("Recursive paths mirror XA addon-reader paths, while the right pane resolves live addon runtime data, generic AtkUnitBase fields, and agent/addon ClientStructs from the same selected addon.");
         ImGui.Separator();
 
-        ImGui.SetNextItemWidth(220);
-        ImGui.InputTextWithHint("##DebugFilter", "Filter path, text, node id, event...", ref debugFilter, 128);
+        ImGui.SetNextItemWidth(Scale(220f));
+        ImGui.InputTextWithHint("##DebugFilter", "Filter nodes, AtkValues, struct fields, text...", ref debugFilter, 128);
         ImGui.SameLine();
         ImGui.Checkbox("Meaningful Only", ref debugMeaningfulOnly);
         ImGui.SameLine();
@@ -736,7 +802,7 @@ public class MainWindow : Window, IDisposable
         ImGui.Checkbox("Visible Only", ref debugVisibleOnly);
 
         var avail = ImGui.GetContentRegionAvail();
-        var leftW = 440f;
+        var leftW = Scale(440f);
 
         using (var child = ImRaii.Child("DebugEntryList", new Vector2(leftW, avail.Y), true))
         {
@@ -750,10 +816,10 @@ public class MainWindow : Window, IDisposable
                     ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable
                     | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingFixedFit))
                 {
-                    ImGui.TableSetupColumn("Path", ImGuiTableColumnFlags.WidthFixed, 130);
-                    ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.WidthFixed, 110);
+                    ImGui.TableSetupColumn("Path", ImGuiTableColumnFlags.WidthFixed, Scale(130f));
+                    ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.WidthFixed, Scale(110f));
                     ImGui.TableSetupColumn("Text / Event", ImGuiTableColumnFlags.WidthStretch);
-                    ImGui.TableSetupColumn("Flags", ImGuiTableColumnFlags.WidthFixed, 70);
+                    ImGui.TableSetupColumn("State", ImGuiTableColumnFlags.WidthFixed, Scale(92f));
                     ImGui.TableHeadersRow();
 
                     for (var i = 0; i < filteredEntries.Count; i++)
@@ -793,6 +859,15 @@ public class MainWindow : Window, IDisposable
                         if (entry.IsInteractive) flags.Add("I");
                         if (entry.HasEvents) flags.Add("E");
                         ImGui.Text(flags.Count > 0 ? string.Join(" ", flags) : "-");
+                        if (ImGui.IsItemHovered())
+                        {
+                            var tooltip = $"NodeFlags: 0x{entry.NodeFlagsRaw:X4}";
+                            if (!string.IsNullOrWhiteSpace(entry.NodeFlagsText))
+                                tooltip += $"\n{entry.NodeFlagsText}";
+                            if (entry.DrawFlags != 0)
+                                tooltip += $"\nDrawFlags: 0x{entry.DrawFlags:X}";
+                            ImGui.SetTooltip(tooltip);
+                        }
                     }
 
                     ImGui.EndTable();
@@ -815,6 +890,63 @@ public class MainWindow : Window, IDisposable
                 DrawCopyLine($"Top-level nodes: {snapshot.NodeCount}");
                 DrawCopyLine($"Recursive entries: {snapshot.Entries.Count}");
                 DrawCopyLine($"Address: 0x{snapshot.Address:X}");
+                DrawCopyLine($"Agent: {(snapshot.AgentAddress != 0 ? $"0x{snapshot.AgentAddress:X}" : "0")}");
+                DrawCopyLine($"Atk Values: {snapshot.AtkValueCount}");
+                DrawAddonLookupSection(snapshot, debugFilter);
+                DrawResolvedStructSection("BaseAddonStruct", snapshot.BaseAddonStruct, debugFilter);
+                DrawResolvedStructSection("AddonStruct", snapshot.AddonStruct, debugFilter);
+                DrawResolvedStructSection("AgentStruct", snapshot.AgentStruct, debugFilter);
+
+                var filteredAtkValues = GetFilteredAtkValues(snapshot);
+                if (filteredAtkValues.Count > 0 && ImGui.CollapsingHeader(string.IsNullOrWhiteSpace(debugFilter)
+                        ? $"Atk Values [{snapshot.AtkValues.Count}]"
+                        : $"Atk Values [{filteredAtkValues.Count} / {snapshot.AtkValues.Count}]"))
+                {
+                    if (ImGui.SmallButton("Copy Atk Values"))
+                        CopyAndNotify(BuildAtkValueReport(snapshot), $"{snapshot.Name} Atk Values");
+
+                    if (ImGui.BeginTable("DebugAtkValues", 3,
+                        ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable
+                        | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingFixedFit,
+                        new Vector2(0, Scale(220f))))
+                    {
+                        ImGui.TableSetupColumn("Index", ImGuiTableColumnFlags.WidthFixed, Scale(54f));
+                        ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.WidthFixed, Scale(110f));
+                        ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthStretch);
+                        ImGui.TableHeadersRow();
+
+                        for (var i = 0; i < filteredAtkValues.Count; i++)
+                        {
+                            var atkValue = filteredAtkValues[i];
+                            var formatted = AddonInspector.FormatAtkValueEntry(atkValue);
+                            ImGui.TableNextRow();
+
+                            ImGui.TableNextColumn();
+                            if (ImGui.Selectable($"#{atkValue.Index}##atkValueIndex{i}"))
+                                CopyAndNotify(formatted, $"{snapshot.Name} AtkValue[{atkValue.Index}]");
+                            if (ImGui.IsItemHovered())
+                                ImGui.SetTooltip(formatted);
+
+                            ImGui.TableNextColumn();
+                            ImGui.Text(atkValue.TypeName);
+
+                            ImGui.TableNextColumn();
+                            var valueText = atkValue.Value ?? string.Empty;
+                            if (valueText.Length > 72)
+                            {
+                                ImGui.Text(valueText[..72] + "...");
+                                if (ImGui.IsItemHovered())
+                                    ImGui.SetTooltip(valueText);
+                            }
+                            else
+                            {
+                                ImGui.TextUnformatted(valueText);
+                            }
+                        }
+
+                        ImGui.EndTable();
+                    }
+                }
 
                 if (selectedNodeIndex >= 0)
                 {
@@ -827,12 +959,25 @@ public class MainWindow : Window, IDisposable
 
                     if (selectedBranch.Count > 0)
                     {
+                        var rootEntry = selectedBranch[0];
                         ImGui.Spacing();
                         ImGui.TextColored(new Vector4(0.4f, 1f, 0.4f, 1f), $"Selected Node Branch [{selectedNodeIndex}]");
                         if (ImGui.SmallButton("Copy Selected Branch"))
                             CopyAndNotify(BuildDebugReport(snapshot, selectedBranch), "Selected branch");
                         ImGui.SameLine();
                         ImGui.TextDisabled($"({selectedBranch.Count} entries)");
+                        ImGui.Separator();
+
+                        DrawCopyLine($"Node Flags: 0x{rootEntry.NodeFlagsRaw:X4}{(string.IsNullOrWhiteSpace(rootEntry.NodeFlagsText) ? string.Empty : $" ({rootEntry.NodeFlagsText})")}");
+                        DrawCopyLine($"Draw Flags: 0x{rootEntry.DrawFlags:X}");
+                        DrawCopyLine($"Child Count: {rootEntry.ChildCount}");
+                        DrawCopyLine($"Priority: {rootEntry.Priority}");
+                        DrawCopyLine($"Depth: {rootEntry.Depth:F2}");
+                        DrawCopyLine($"Parent: {(rootEntry.ParentAddress != 0 ? $"0x{rootEntry.ParentAddress:X}" : "0")}");
+                        DrawCopyLine($"Prev Sibling: {(rootEntry.PrevSiblingAddress != 0 ? $"0x{rootEntry.PrevSiblingAddress:X}" : "0")}");
+                        DrawCopyLine($"Next Sibling: {(rootEntry.NextSiblingAddress != 0 ? $"0x{rootEntry.NextSiblingAddress:X}" : "0")}");
+                        DrawCopyLine($"Child: {(rootEntry.ChildAddress != 0 ? $"0x{rootEntry.ChildAddress:X}" : "0")}");
+                        DrawCopyLine($"Component: {(rootEntry.ComponentAddress != 0 ? $"0x{rootEntry.ComponentAddress:X}" : "0")}");
                         ImGui.Separator();
 
                         var previewCount = Math.Min(selectedBranch.Count, 16);
@@ -854,7 +999,7 @@ public class MainWindow : Window, IDisposable
                 ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Workflow:");
                 ImGui.TextWrapped("1. Enable Logging to catch addon timing and open/close events.");
                 ImGui.TextWrapped("2. Select the addon in the Addons tab.");
-                ImGui.TextWrapped("3. Use this tab to copy recursive paths, text nodes, event params, and focused branches before moving anything into XA Database or XA Slave.");
+                ImGui.TextWrapped("3. Use this tab to copy recursive paths, raw node flags, resolved addon/agent ClientStruct fields, and focused branches before moving anything into XA Database or XA Slave.");
             }
         }
     }
@@ -898,15 +1043,44 @@ public class MainWindow : Window, IDisposable
             .ToList();
     }
 
-    private string BuildDebugReport(AddonDebugSnapshot snapshot, List<AddonDebugEntry> entries)
+    private string BuildDebugReport(AddonDebugSnapshot snapshot, List<AddonDebugEntry> entries, string filter = "")
     {
         var lines = new List<string>
         {
             $"Addon: {snapshot.Name}",
             $"Visible: {snapshot.IsVisible}  Ready: {snapshot.IsReady}  Scale: {snapshot.Scale:F2}",
             $"Pos: ({snapshot.Position.X:F1}, {snapshot.Position.Y:F1})  Size: {snapshot.Size.X:F1} x {snapshot.Size.Y:F1}",
-            $"Top-level nodes: {snapshot.NodeCount}  Recursive entries: {entries.Count}  Addr: 0x{snapshot.Address:X}"
+            $"Top-level nodes: {snapshot.NodeCount}  Recursive entries: {entries.Count}  Addr: 0x{snapshot.Address:X}",
+            $"Agent: {(snapshot.AgentAddress != 0 ? $"0x{snapshot.AgentAddress:X}" : "0")}",
+            $"Selected lookup source: {snapshot.SelectedAddonLookupSource}",
+            $"Atk Values [{snapshot.AtkValueCount}]"
         };
+
+        AppendMultilineBlock(lines, BuildAddonLookupReport(snapshot, filter));
+        AppendMultilineBlock(lines, BuildStructReport(snapshot.BaseAddonStruct ?? new ResolvedNativeStructSnapshot
+        {
+            Kind = "Addon Base Struct",
+            LookupKey = "AtkUnitBase",
+            Address = snapshot.Address,
+            ResolutionInfo = "No base AtkUnitBase snapshot collected."
+        }, filter));
+        AppendMultilineBlock(lines, BuildStructReport(snapshot.AddonStruct ?? new ResolvedNativeStructSnapshot
+        {
+            Kind = "Addon Struct",
+            LookupKey = snapshot.Name,
+            Address = snapshot.Address,
+            ResolutionInfo = "No struct snapshot collected."
+        }, filter));
+        AppendMultilineBlock(lines, BuildStructReport(snapshot.AgentStruct ?? new ResolvedNativeStructSnapshot
+        {
+            Kind = "Agent Struct",
+            LookupKey = snapshot.Name,
+            Address = snapshot.AgentAddress,
+            ResolutionInfo = "No struct snapshot collected."
+        }, filter));
+
+        foreach (var atkValue in GetFilteredAtkValues(snapshot, filter))
+            lines.Add(AddonInspector.FormatAtkValueEntry(atkValue));
 
         foreach (var entry in entries)
             lines.Add(AddonInspector.FormatDebugEntry(entry));
@@ -914,12 +1088,341 @@ public class MainWindow : Window, IDisposable
         return string.Join("\n", lines);
     }
 
+    private static string BuildAtkValueReport(AddonDebugSnapshot snapshot)
+    {
+        var lines = new List<string>
+        {
+            $"Addon: {snapshot.Name}",
+            $"Agent: {(snapshot.AgentAddress != 0 ? $"0x{snapshot.AgentAddress:X}" : "0")}",
+            $"Atk Values [{snapshot.AtkValueCount}]"
+        };
+
+        foreach (var atkValue in snapshot.AtkValues)
+            lines.Add(AddonInspector.FormatAtkValueEntry(atkValue));
+
+        return string.Join("\n", lines);
+    }
+
+    private void DrawAddonLookupSection(AddonDebugSnapshot snapshot, string filter)
+    {
+        var totalEntries = snapshot.GameGuiAddonInstances.Count + (snapshot.RaptureAddonInstance != null ? 1 : 0);
+        var filteredEntries = GetFilteredAddonLookupInstances(snapshot, filter);
+        var summaryMatches = string.IsNullOrWhiteSpace(filter) || MatchesAddonLookupSummaryFilter(snapshot, filter);
+        if (!summaryMatches && filteredEntries.Count == 0)
+            return;
+
+        ImGui.Spacing();
+        using var scopedId = ImRaii.PushId("AddonLookupSection");
+        var header = string.IsNullOrWhiteSpace(filter)
+            ? $"Addon Lookup Instances [{totalEntries}]"
+            : $"Addon Lookup Instances [{filteredEntries.Count} / {totalEntries}]";
+        if (!ImGui.CollapsingHeader(header))
+            return;
+
+        DrawCopyLine($"Selected Snapshot Source: {snapshot.SelectedAddonLookupSource}");
+        if (ImGui.SmallButton("Copy Lookup Dump"))
+            CopyAndNotify(BuildAddonLookupReport(snapshot, filter), $"{snapshot.Name} lookup dump");
+
+        if (totalEntries == 0)
+        {
+            ImGui.TextDisabled("No GameGui or Rapture addon instances were found for the selected addon.");
+            return;
+        }
+
+        if (filteredEntries.Count == 0)
+        {
+            ImGui.TextDisabled("No addon lookup instances match the current debug filter.");
+            return;
+        }
+
+        if (ImGui.BeginTable("AddonLookupInstances", 4,
+            ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable
+            | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingFixedFit,
+            new Vector2(0, Scale(180f))))
+        {
+            ImGui.TableSetupColumn("Source", ImGuiTableColumnFlags.WidthFixed, Scale(130f));
+            ImGui.TableSetupColumn("Address", ImGuiTableColumnFlags.WidthFixed, Scale(118f));
+            ImGui.TableSetupColumn("State", ImGuiTableColumnFlags.WidthFixed, Scale(96f));
+            ImGui.TableSetupColumn("Geometry", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableHeadersRow();
+
+            for (var i = 0; i < filteredEntries.Count; i++)
+            {
+                var entry = filteredEntries[i];
+                var formatted = AddonInspector.FormatAddonLookupEntry(entry);
+                var sourceLabel = entry.Source.Equals("GameGui", StringComparison.OrdinalIgnoreCase)
+                    ? $"GameGui[{entry.Index}]"
+                    : entry.Source;
+                var stateLabel = $"{(entry.IsVisible ? "V" : "-")} {(entry.IsReady ? "R" : "-")} {(entry.MatchesSelectedSnapshot ? "SEL" : "-")}";
+                var geometryLabel =
+                    $"Pos=({entry.Position.X:F1}, {entry.Position.Y:F1}) Size={entry.Size.X:F1}x{entry.Size.Y:F1} Scale={entry.Scale:F2} Nodes={entry.NodeCount}";
+
+                ImGui.TableNextRow();
+
+                ImGui.TableNextColumn();
+                if (ImGui.Selectable($"{sourceLabel}##lookup{i}"))
+                    CopyAndNotify(formatted, $"{snapshot.Name} {sourceLabel}");
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(formatted);
+
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted($"0x{entry.Address:X}");
+
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(stateLabel);
+
+                ImGui.TableNextColumn();
+                DrawTrimmedTableText(geometryLabel);
+            }
+
+            ImGui.EndTable();
+        }
+    }
+
+    private void DrawResolvedStructSection(string id, ResolvedNativeStructSnapshot? snapshot, string filter)
+    {
+        if (snapshot == null)
+            return;
+
+        var filteredFields = GetFilteredStructFields(snapshot, filter);
+        var summaryMatches = string.IsNullOrWhiteSpace(filter) || MatchesResolvedStructSummaryFilter(snapshot, filter);
+        if (!summaryMatches && filteredFields.Count == 0)
+            return;
+
+        ImGui.Spacing();
+        using var scopedId = ImRaii.PushId(id);
+        var header = string.IsNullOrWhiteSpace(filter)
+            ? $"{snapshot.Kind}: {snapshot.TypeName}"
+            : $"{snapshot.Kind}: {snapshot.TypeName} ({filteredFields.Count} / {snapshot.Fields.Count})";
+        if (!ImGui.CollapsingHeader(header))
+            return;
+
+        DrawCopyLine($"Lookup: {snapshot.LookupKey}");
+        DrawCopyLine($"Resolved: {snapshot.IsResolved}");
+        DrawCopyLine($"Type: {snapshot.TypeName}");
+        DrawCopyLine($"Full Type: {snapshot.FullTypeName}");
+        DrawCopyLine($"Address: 0x{snapshot.Address:X}");
+        DrawCopyLine($"Size: 0x{snapshot.Size:X}");
+        DrawCopyLine($"Resolution: {snapshot.ResolutionInfo}");
+
+        if (ImGui.SmallButton("Copy Struct Dump"))
+            CopyAndNotify(ClientStructRuntimeInspector.BuildStructReport(snapshot), $"{snapshot.Kind} dump");
+
+        if (snapshot.Fields.Count == 0)
+        {
+            ImGui.TextDisabled("No field data is available for this struct.");
+            return;
+        }
+
+        if (filteredFields.Count == 0)
+        {
+            ImGui.TextDisabled("No struct fields match the current debug filter.");
+            return;
+        }
+
+        if (ImGui.BeginTable("ResolvedStructFields", 4,
+            ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable
+            | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingFixedFit,
+            new Vector2(0, Scale(220f))))
+        {
+            ImGui.TableSetupColumn("Offset", ImGuiTableColumnFlags.WidthFixed, Scale(60f));
+            ImGui.TableSetupColumn("Type", ImGuiTableColumnFlags.WidthFixed, Scale(130f));
+            ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthFixed, Scale(150f));
+            ImGui.TableSetupColumn("Value", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableHeadersRow();
+
+            for (var i = 0; i < filteredFields.Count; i++)
+            {
+                var field = filteredFields[i];
+                var formatted = ClientStructRuntimeInspector.FormatFieldEntry(field);
+
+                ImGui.TableNextRow();
+
+                ImGui.TableNextColumn();
+                if (ImGui.Selectable($"0x{field.Offset:X3}##offset{i}"))
+                    CopyAndNotify(formatted, $"{snapshot.Kind} +0x{field.Offset:X3}");
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(formatted);
+
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(field.TypeName);
+
+                ImGui.TableNextColumn();
+                ImGui.TextUnformatted(field.Name);
+
+                ImGui.TableNextColumn();
+                DrawTrimmedTableText(field.Value, field.Notes);
+            }
+
+            ImGui.EndTable();
+        }
+    }
+
+    private static void AppendMultilineBlock(List<string> lines, string block)
+    {
+        if (string.IsNullOrWhiteSpace(block))
+            return;
+
+        if (lines.Count > 0)
+            lines.Add(string.Empty);
+
+        lines.AddRange(block.Split('\n'));
+    }
+
+    private static void DrawTrimmedTableText(string text, string notes = "")
+    {
+        var displayText = text ?? string.Empty;
+        if (displayText.Length > 72)
+        {
+            ImGui.Text(displayText[..72] + "...");
+            if (ImGui.IsItemHovered())
+                ImGui.SetTooltip(string.IsNullOrWhiteSpace(notes) ? displayText : $"{displayText}\n{notes}");
+            return;
+        }
+
+        ImGui.TextUnformatted(displayText);
+        if (!string.IsNullOrWhiteSpace(notes) && ImGui.IsItemHovered())
+            ImGui.SetTooltip(notes);
+    }
+
+    private List<AddonAtkValueInfo> GetFilteredAtkValues(AddonDebugSnapshot snapshot)
+        => GetFilteredAtkValues(snapshot, debugFilter);
+
+    private static List<AddonAtkValueInfo> GetFilteredAtkValues(AddonDebugSnapshot snapshot, string filter)
+        => snapshot.AtkValues
+            .Where(entry => string.IsNullOrWhiteSpace(filter) || MatchesAtkValueFilter(entry, filter))
+            .ToList();
+
+    private static List<AddonLookupInstanceInfo> GetFilteredAddonLookupInstances(AddonDebugSnapshot snapshot, string filter)
+    {
+        var entries = new List<AddonLookupInstanceInfo>(snapshot.GameGuiAddonInstances.Count + (snapshot.RaptureAddonInstance != null ? 1 : 0));
+        entries.AddRange(snapshot.GameGuiAddonInstances);
+        if (snapshot.RaptureAddonInstance != null)
+            entries.Add(snapshot.RaptureAddonInstance);
+
+        return string.IsNullOrWhiteSpace(filter)
+            ? entries
+            : entries.Where(entry => MatchesAddonLookupFilter(entry, filter)).ToList();
+    }
+
+    private static List<ResolvedNativeFieldInfo> GetFilteredStructFields(ResolvedNativeStructSnapshot snapshot, string filter)
+        => string.IsNullOrWhiteSpace(filter)
+            ? snapshot.Fields
+            : snapshot.Fields.Where(field => MatchesResolvedFieldFilter(field, filter)).ToList();
+
+    private static string BuildAddonLookupReport(AddonDebugSnapshot snapshot, string filter)
+    {
+        var totalEntries = snapshot.GameGuiAddonInstances.Count + (snapshot.RaptureAddonInstance != null ? 1 : 0);
+        var filteredEntries = GetFilteredAddonLookupInstances(snapshot, filter);
+        var summaryMatches = string.IsNullOrWhiteSpace(filter) || MatchesAddonLookupSummaryFilter(snapshot, filter);
+        if (!summaryMatches && filteredEntries.Count == 0)
+            return string.Empty;
+
+        var lines = new List<string>
+        {
+            $"Addon Lookup: {snapshot.Name}",
+            $"Selected Snapshot Source: {snapshot.SelectedAddonLookupSource}",
+            $"Instances [{filteredEntries.Count}/{totalEntries}]"
+        };
+
+        if (filteredEntries.Count == 0)
+        {
+            lines.Add("No addon lookup instances match the current debug filter.");
+            return string.Join("\n", lines);
+        }
+
+        foreach (var entry in filteredEntries)
+            lines.Add(AddonInspector.FormatAddonLookupEntry(entry));
+
+        return string.Join("\n", lines);
+    }
+
+    private static string BuildStructReport(ResolvedNativeStructSnapshot snapshot, string filter)
+    {
+        if (string.IsNullOrWhiteSpace(filter))
+            return ClientStructRuntimeInspector.BuildStructReport(snapshot);
+
+        var filteredFields = GetFilteredStructFields(snapshot, filter);
+        var summaryMatches = MatchesResolvedStructSummaryFilter(snapshot, filter);
+        if (!summaryMatches && filteredFields.Count == 0)
+            return string.Empty;
+
+        var lines = new List<string>
+        {
+            $"{snapshot.Kind}: {snapshot.LookupKey}",
+            $"Resolved: {snapshot.IsResolved}",
+            $"Type: {snapshot.TypeName}",
+            $"Full Type: {snapshot.FullTypeName}",
+            $"Address: 0x{snapshot.Address:X}",
+            $"Size: 0x{snapshot.Size:X}",
+            $"Resolution: {snapshot.ResolutionInfo}",
+            $"Fields [{filteredFields.Count}/{snapshot.Fields.Count}]"
+        };
+
+        foreach (var field in filteredFields)
+            lines.Add(ClientStructRuntimeInspector.FormatFieldEntry(field));
+
+        return string.Join("\n", lines);
+    }
+
+    private static bool MatchesAtkValueFilter(AddonAtkValueInfo entry, string filter)
+        => entry.Index.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || entry.TypeName.Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || entry.TypeRaw.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || entry.Address.ToString("X").Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || (!string.IsNullOrEmpty(entry.Value) && entry.Value.Contains(filter, StringComparison.OrdinalIgnoreCase));
+
+    private static bool MatchesAddonLookupSummaryFilter(AddonDebugSnapshot snapshot, string filter)
+        => snapshot.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || snapshot.SelectedAddonLookupSource.Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || "Addon Lookup".Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || "GameGui".Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || "RaptureAtkUnitManager".Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || "Selected Snapshot Source".Contains(filter, StringComparison.OrdinalIgnoreCase);
+
+    private static bool MatchesAddonLookupFilter(AddonLookupInstanceInfo entry, string filter)
+    {
+        var sourceLabel = entry.Source.Equals("GameGui", StringComparison.OrdinalIgnoreCase)
+            ? $"GameGui[{entry.Index}]"
+            : entry.Source;
+        return sourceLabel.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.Address.ToString("X").Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.IsVisible.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.IsReady.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.NodeCount.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.Position.X.ToString("F1").Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.Position.Y.ToString("F1").Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.Size.X.ToString("F1").Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.Size.Y.ToString("F1").Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.Scale.ToString("F2").Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || (entry.MatchesSelectedSnapshot && "selected".Contains(filter, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool MatchesResolvedStructSummaryFilter(ResolvedNativeStructSnapshot snapshot, string filter)
+        => snapshot.Kind.Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || snapshot.LookupKey.Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || snapshot.TypeName.Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || snapshot.FullTypeName.Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || snapshot.Address.ToString("X").Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || snapshot.Size.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || snapshot.ResolutionInfo.Contains(filter, StringComparison.OrdinalIgnoreCase);
+
+    private static bool MatchesResolvedFieldFilter(ResolvedNativeFieldInfo field, string filter)
+        => field.Offset.ToString("X").Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || field.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || field.TypeName.Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || field.Address.ToString("X").Contains(filter, StringComparison.OrdinalIgnoreCase)
+           || (!string.IsNullOrEmpty(field.Value) && field.Value.Contains(filter, StringComparison.OrdinalIgnoreCase))
+           || (!string.IsNullOrEmpty(field.Notes) && field.Notes.Contains(filter, StringComparison.OrdinalIgnoreCase));
+
     private static bool MatchesDebugEntryFilter(AddonDebugEntry entry, string filter)
     {
         return entry.Path.Contains(filter, StringComparison.OrdinalIgnoreCase)
             || entry.TypeName.Contains(filter, StringComparison.OrdinalIgnoreCase)
             || entry.NodeId.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
             || entry.TypeRaw.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || entry.NodeFlagsRaw.ToString("X").Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || (!string.IsNullOrEmpty(entry.NodeFlagsText) && entry.NodeFlagsText.Contains(filter, StringComparison.OrdinalIgnoreCase))
             || (entry.HasEvents && entry.EventParam.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase))
             || (!string.IsNullOrEmpty(entry.Text) && entry.Text.Contains(filter, StringComparison.OrdinalIgnoreCase));
     }
@@ -1173,7 +1676,7 @@ public class MainWindow : Window, IDisposable
         ImGui.TextDisabled(sheetSchemaStatus);
         ImGui.Separator();
 
-        ImGui.SetNextItemWidth(100);
+        ImGui.SetNextItemWidth(Scale(100f));
         var rowId = (int)sheetPreviewRowId;
         if (ImGui.InputInt("Row ID", ref rowId))
             sheetPreviewRowId = (uint)Math.Max(0, rowId);
@@ -1181,7 +1684,7 @@ public class MainWindow : Window, IDisposable
         if (ImGui.SmallButton("Jump Row"))
             ReadSheetRow(selectedSheetName, sheetPreviewRowId, true);
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(110);
+        ImGui.SetNextItemWidth(Scale(110f));
         var startIndex = sheetPreviewStartIndex;
         if (ImGui.InputInt("Start Index", ref startIndex))
             sheetPreviewStartIndex = Math.Max(0, startIndex);
@@ -1189,7 +1692,7 @@ public class MainWindow : Window, IDisposable
         if (ImGui.SmallButton("Load Window"))
             ReadSheetRow(selectedSheetName, sheetPreviewRowId);
 
-        ImGui.SetNextItemWidth(70);
+        ImGui.SetNextItemWidth(Scale(70f));
         var rowsToShow = sheetPreviewRowCount;
         if (ImGui.InputInt("Rows", ref rowsToShow))
         {
@@ -1221,8 +1724,8 @@ public class MainWindow : Window, IDisposable
         ImGui.Separator();
 
         var avail = ImGui.GetContentRegionAvail();
-        var detailWidth = Math.Clamp(avail.X * 0.32f, 280f, 360f);
-        var gridWidth = Math.Max(320f, avail.X - detailWidth - 10f);
+        var detailWidth = Math.Clamp(avail.X * 0.32f, Scale(280f), Scale(360f));
+        var gridWidth = Math.Max(Scale(320f), avail.X - detailWidth - Scale(10f));
 
         using (var gridChild = ImRaii.Child("SheetGrid", new Vector2(gridWidth, avail.Y), true))
         {
@@ -1253,10 +1756,10 @@ public class MainWindow : Window, IDisposable
             return;
 
         ImGui.TableSetupScrollFreeze(2, 1);
-        ImGui.TableSetupColumn("Idx", ImGuiTableColumnFlags.WidthFixed, 52f);
-        ImGui.TableSetupColumn("RowId", ImGuiTableColumnFlags.WidthFixed, 72f);
+        ImGui.TableSetupColumn("Idx", ImGuiTableColumnFlags.WidthFixed, Scale(52f));
+        ImGui.TableSetupColumn("RowId", ImGuiTableColumnFlags.WidthFixed, Scale(72f));
         foreach (var column in sheetPreviewColumns)
-            ImGui.TableSetupColumn(column.Header, ImGuiTableColumnFlags.WidthFixed, column.Width);
+            ImGui.TableSetupColumn(column.Header, ImGuiTableColumnFlags.WidthFixed, Scale(column.Width));
 
         ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
         ImGui.TableNextColumn();
@@ -1446,14 +1949,21 @@ public class MainWindow : Window, IDisposable
     {
         if (ImGui.BeginTabBar("ClientStructsSheetsTabs"))
         {
-            if (ImGui.BeginTabItem("Common Views"))
+            var commonFlags = switchToClientStructsCommonView ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
+            if (ImGui.BeginTabItem("Common Views", commonFlags))
             {
                 DrawClientStructsCommonView();
                 ImGui.EndTabItem();
             }
+            switchToClientStructsCommonView = false;
             if (ImGui.BeginTabItem($"All Views ({clientStructsSheetService.Definitions.Count})"))
             {
                 DrawClientStructsAllView();
+                ImGui.EndTabItem();
+            }
+            if (ImGui.BeginTabItem("Master Search"))
+            {
+                DrawClientStructsMasterSearchView();
                 ImGui.EndTabItem();
             }
             ImGui.EndTabBar();
@@ -1560,6 +2070,258 @@ public class MainWindow : Window, IDisposable
         }
     }
 
+    private void DrawClientStructsMasterSearchView()
+    {
+        ImGui.SetNextItemWidth(Scale(360f));
+        var submitted = ImGui.InputTextWithHint(
+            "##ClientStructsMasterSearch",
+            "Search all ClientStructs runtime views (min 3 chars)...",
+            ref clientStructsMasterSearchFilter,
+            128,
+            ImGuiInputTextFlags.EnterReturnsTrue);
+
+        if (submitted || ImGui.IsItemDeactivatedAfterEdit())
+            RefreshClientStructsMasterSearch(true);
+
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Search"))
+            RefreshClientStructsMasterSearch(true);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Refresh Results"))
+            RefreshClientStructsMasterSearch(true);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Eureka"))
+        {
+            clientStructsMasterSearchFilter = "Eureka";
+            RefreshClientStructsMasterSearch(true);
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Instance"))
+        {
+            clientStructsMasterSearchFilter = "Instance";
+            RefreshClientStructsMasterSearch(true);
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Territory"))
+        {
+            clientStructsMasterSearchFilter = "Territory";
+            RefreshClientStructsMasterSearch(true);
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Content"))
+        {
+            clientStructsMasterSearchFilter = "Content";
+            RefreshClientStructsMasterSearch(true);
+        }
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Clear"))
+        {
+            clientStructsMasterSearchFilter = string.Empty;
+            RefreshClientStructsMasterSearch(true);
+        }
+
+        ImGui.TextDisabled(clientStructsMasterSearchStatus);
+        if (clientStructsMasterSearchLastRefresh != DateTime.MinValue)
+            ImGui.TextDisabled($"Last search: {clientStructsMasterSearchLastRefresh.ToLocalTime():HH:mm:ss}");
+        ImGui.Separator();
+
+        var avail = ImGui.GetContentRegionAvail();
+        var resultsWidth = Math.Clamp(avail.X * 0.48f, Scale(360f), Scale(560f));
+
+        using (var child = ImRaii.Child("ClientStructsMasterSearchResults", new Vector2(resultsWidth, avail.Y), true))
+        {
+            if (child.Success)
+            {
+                ImGui.TextColored(new Vector4(0.4f, 0.8f, 1f, 1f), $"Results ({clientStructsMasterSearchResults.Count})");
+                ImGui.TextDisabled("Right-click any result to copy it.");
+                ImGui.Separator();
+
+                if (clientStructsMasterSearchResults.Count == 0)
+                {
+                    ImGui.TextDisabled(clientStructsMasterSearchFilter.Trim().Length >= 3
+                        ? "No ClientStructs matches were found for the current query."
+                        : "Enter at least 3 characters, then press Search.");
+                }
+                else
+                {
+                    for (var i = 0; i < clientStructsMasterSearchResults.Count; i++)
+                    {
+                        var result = clientStructsMasterSearchResults[i];
+                        var label = $"{result.SheetName} | {result.MatchSource} | {TruncateSheetCellText(result.DisplayText, 54)}";
+                        if (ImGui.Selectable($"{label}##clientStructsSearchResult{i}", selectedClientStructsMasterSearchResult == i))
+                            selectedClientStructsMasterSearchResult = i;
+                        if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
+                            CopyAndNotify(BuildClientStructsSearchResultCopyText(result), $"{result.SheetName} search result");
+                        if (ImGui.IsItemHovered())
+                            ImGui.SetTooltip(BuildClientStructsSearchResultCopyText(result));
+                    }
+                }
+            }
+        }
+
+        ImGui.SameLine();
+
+        using (var child = ImRaii.Child("ClientStructsMasterSearchSelection", new Vector2(0, avail.Y), true))
+        {
+            if (child.Success)
+                DrawClientStructsMasterSearchSelection();
+        }
+    }
+
+    private void RefreshClientStructsMasterSearch(bool force = false)
+    {
+        var trimmedFilter = clientStructsMasterSearchFilter.Trim();
+        clientStructsMasterSearchFilter = trimmedFilter;
+
+        if (trimmedFilter.Length < 3)
+        {
+            clientStructsMasterSearchResults.Clear();
+            selectedClientStructsMasterSearchResult = -1;
+            clientStructsMasterSearchLastQuery = trimmedFilter;
+            clientStructsMasterSearchStatus = string.IsNullOrWhiteSpace(trimmedFilter)
+                ? "Enter at least 3 characters to search across all ClientStructs runtime views."
+                : "Master search requires at least 3 characters.";
+            return;
+        }
+
+        if (!force
+            && string.Equals(trimmedFilter, clientStructsMasterSearchLastQuery, StringComparison.Ordinal)
+            && clientStructsMasterSearchResults.Count > 0)
+            return;
+
+        clientStructsMasterSearchResults = clientStructsSheetService.SearchAllSheets(trimmedFilter, new ClientStructsSheetRequest
+        {
+            StartIndex = 0,
+            RowCount = 100,
+            InventoryType = clientStructsInventoryType
+        });
+
+        clientStructsMasterSearchLastQuery = trimmedFilter;
+        clientStructsMasterSearchLastRefresh = DateTime.UtcNow;
+        selectedClientStructsMasterSearchResult = clientStructsMasterSearchResults.Count > 0 ? 0 : -1;
+        clientStructsMasterSearchStatus = clientStructsMasterSearchResults.Count == 0
+            ? $"No ClientStructs matches found for '{trimmedFilter}'."
+            : $"Found {clientStructsMasterSearchResults.Count} ClientStructs match(es) for '{trimmedFilter}'.";
+    }
+
+    private void DrawClientStructsMasterSearchSelection()
+    {
+        ImGui.TextColored(new Vector4(0.4f, 0.8f, 1f, 1f), "Result Detail");
+        ImGui.Separator();
+
+        if (selectedClientStructsMasterSearchResult < 0 || selectedClientStructsMasterSearchResult >= clientStructsMasterSearchResults.Count)
+        {
+            ImGui.TextDisabled("Select a master-search result to inspect or open it in the runtime preview.");
+            return;
+        }
+
+        var result = clientStructsMasterSearchResults[selectedClientStructsMasterSearchResult];
+
+        DrawCopyLine($"Sheet: {result.SheetName}");
+        DrawCopyLine($"Category: {result.Category}");
+        DrawCopyLine($"Match: {result.MatchSource}");
+        if (result.RowIndex >= 0)
+            DrawCopyLine($"Row Index: {result.RowIndex}");
+        if (result.RowId != 0)
+            DrawCopyLine($"Row ID: {result.RowId}");
+        if (result.ColumnIndex >= 0)
+            DrawCopyLine($"Column: {result.ColumnHeader} [{result.ColumnIndex}]");
+
+        if (ImGui.SmallButton("Open In Preview"))
+            OpenClientStructsSearchResult(result);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Copy Result"))
+            CopyAndNotify(BuildClientStructsSearchResultCopyText(result), $"{result.SheetName} search result");
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Copy All Results") && clientStructsMasterSearchResults.Count > 0)
+            CopyAndNotify(BuildClientStructsSearchResultsCopyText(), "All ClientStructs search results");
+
+        ImGui.Spacing();
+        ImGui.TextColored(new Vector4(1f, 0.9f, 0.6f, 1f), "Matched Text");
+        ImGui.TextWrapped(result.DisplayText);
+        if (ImGui.IsItemClicked())
+            CopyAndNotify(result.DisplayText, "Matched text");
+
+        if (!string.IsNullOrWhiteSpace(result.RawText) && !string.Equals(result.RawText, result.DisplayText, StringComparison.Ordinal))
+        {
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(0.7f, 0.9f, 1f, 1f), "Raw Text");
+            ImGui.TextWrapped(result.RawText);
+            if (ImGui.IsItemClicked())
+                CopyAndNotify(result.RawText, "Raw text");
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.DetailText))
+        {
+            ImGui.Spacing();
+            ImGui.TextColored(new Vector4(0.6f, 0.6f, 0.6f, 1f), "Details");
+            ImGui.TextWrapped(result.DetailText);
+            if (ImGui.IsItemClicked())
+                CopyAndNotify(result.DetailText, "Search detail");
+        }
+    }
+
+    private void OpenClientStructsSearchResult(ClientStructsSearchResult result)
+    {
+        var definition = clientStructsSheetService.GetDefinition(result.SheetName);
+        if (definition == null)
+            return;
+
+        selectedClientStructsSheetName = result.SheetName;
+        clientStructsValueFilter = string.Empty;
+        selectedClientStructsPreviewRow = -1;
+        selectedClientStructsPreviewColumn = -1;
+        clientStructsPreviewStartIndex = definition.SupportsWindowing && result.RowIndex >= 0
+            ? Math.Max(0, result.RowIndex - Math.Min(3, Math.Max(5, clientStructsPreviewRowCount) / 3))
+            : 0;
+
+        RefreshSelectedClientStructsSheet(true);
+
+        var snapshot = clientStructsSheetSnapshot;
+        if (snapshot != null && result.RowIndex >= 0)
+        {
+            var rowListIndex = snapshot.Rows.FindIndex(row => row.RowIndex == result.RowIndex && (result.RowId == 0 || row.RowId == result.RowId));
+            if (rowListIndex >= 0)
+                selectedClientStructsPreviewRow = rowListIndex;
+        }
+
+        if (snapshot != null && result.ColumnIndex >= 0 && snapshot.Columns.Count > 0)
+            selectedClientStructsPreviewColumn = Math.Clamp(result.ColumnIndex, 0, snapshot.Columns.Count - 1);
+
+        switchToClientStructsCommonView = true;
+    }
+
+    private static string BuildClientStructsSearchResultCopyText(ClientStructsSearchResult result)
+    {
+        var lines = new List<string>
+        {
+            $"Sheet: {result.SheetName}",
+            $"Category: {result.Category}",
+            $"Match: {result.MatchSource}"
+        };
+
+        if (result.RowIndex >= 0)
+            lines.Add($"Row Index: {result.RowIndex}");
+        if (result.RowId != 0)
+            lines.Add($"Row ID: {result.RowId}");
+        if (result.ColumnIndex >= 0)
+            lines.Add($"Column: {result.ColumnHeader} [{result.ColumnIndex}]");
+
+        lines.Add($"Display: {result.DisplayText}");
+
+        if (!string.IsNullOrWhiteSpace(result.RawText) && !string.Equals(result.RawText, result.DisplayText, StringComparison.Ordinal))
+            lines.Add($"Raw: {result.RawText}");
+        if (!string.IsNullOrWhiteSpace(result.DetailText))
+            lines.Add($"Details: {result.DetailText}");
+
+        return string.Join("\n", lines);
+    }
+
+    private string BuildClientStructsSearchResultsCopyText()
+        => string.Join(
+            "\n\n",
+            clientStructsMasterSearchResults.Select(BuildClientStructsSearchResultCopyText));
+
     private void SelectClientStructsSheet(string name)
     {
         selectedClientStructsSheetName = name;
@@ -1649,7 +2411,7 @@ public class MainWindow : Window, IDisposable
         if (snapshot.Definition.SupportsInventoryType)
         {
             ImGui.SameLine();
-            ImGui.SetNextItemWidth(220f);
+            ImGui.SetNextItemWidth(Scale(220f));
             if (ImGui.BeginCombo("InventoryType", clientStructsInventoryType.ToString()))
             {
                 foreach (var inventoryType in ClientStructsInventoryTypes)
@@ -1674,7 +2436,7 @@ public class MainWindow : Window, IDisposable
 
         if (snapshot.Definition.SupportsWindowing)
         {
-            ImGui.SetNextItemWidth(110f);
+            ImGui.SetNextItemWidth(Scale(110f));
             var startIndex = clientStructsPreviewStartIndex;
             if (ImGui.InputInt("Start Index", ref startIndex))
                 clientStructsPreviewStartIndex = Math.Max(0, startIndex);
@@ -1682,7 +2444,7 @@ public class MainWindow : Window, IDisposable
             if (ImGui.SmallButton("Load Window"))
                 RefreshSelectedClientStructsSheet();
 
-            ImGui.SetNextItemWidth(70f);
+            ImGui.SetNextItemWidth(Scale(70f));
             var rowsToShow = clientStructsPreviewRowCount;
             if (ImGui.InputInt("Rows", ref rowsToShow))
             {
@@ -1709,14 +2471,23 @@ public class MainWindow : Window, IDisposable
             }
         }
 
+        ImGui.SetNextItemWidth(Scale(260f));
+        ImGui.InputTextWithHint("##ClientStructsValueFilter", "Filter loaded rows / raw values...", ref clientStructsValueFilter, 128);
+        ImGui.SameLine();
+        if (ImGui.SmallButton("Clear Row Filter"))
+            clientStructsValueFilter = string.Empty;
+
         if (!string.IsNullOrWhiteSpace(snapshot.Message))
             ImGui.TextDisabled(snapshot.Message);
+
+        if (!string.IsNullOrWhiteSpace(clientStructsValueFilter))
+            ImGui.TextDisabled("Row filter searches only the currently loaded runtime window.");
 
         ImGui.Separator();
 
         var avail = ImGui.GetContentRegionAvail();
-        var detailWidth = Math.Clamp(avail.X * 0.32f, 280f, 360f);
-        var gridWidth = Math.Max(320f, avail.X - detailWidth - 10f);
+        var detailWidth = Math.Clamp(avail.X * 0.32f, Scale(280f), Scale(360f));
+        var gridWidth = Math.Max(Scale(320f), avail.X - detailWidth - Scale(10f));
 
         using (var gridChild = ImRaii.Child("ClientStructsSheetGridChild", new Vector2(gridWidth, avail.Y), true))
         {
@@ -1742,16 +2513,25 @@ public class MainWindow : Window, IDisposable
             return;
         }
 
+        var visibleRows = GetVisibleClientStructsRows(snapshot);
+        if (visibleRows.Count == 0)
+        {
+            ImGui.TextDisabled(string.IsNullOrWhiteSpace(clientStructsValueFilter)
+                ? "No runtime rows loaded."
+                : "No loaded runtime rows match the current row filter.");
+            return;
+        }
+
         if (!ImGui.BeginTable("ClientStructsSheetGrid", snapshot.Columns.Count + 2,
             ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable
             | ImGuiTableFlags.ScrollX | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingFixedFit))
             return;
 
         ImGui.TableSetupScrollFreeze(2, 1);
-        ImGui.TableSetupColumn("Idx", ImGuiTableColumnFlags.WidthFixed, 52f);
-        ImGui.TableSetupColumn("RowId", ImGuiTableColumnFlags.WidthFixed, 72f);
+        ImGui.TableSetupColumn("Idx", ImGuiTableColumnFlags.WidthFixed, Scale(52f));
+        ImGui.TableSetupColumn("RowId", ImGuiTableColumnFlags.WidthFixed, Scale(72f));
         foreach (var column in snapshot.Columns)
-            ImGui.TableSetupColumn(column.Header, ImGuiTableColumnFlags.WidthFixed, column.Width);
+            ImGui.TableSetupColumn(column.Header, ImGuiTableColumnFlags.WidthFixed, Scale(column.Width));
 
         ImGui.TableNextRow(ImGuiTableRowFlags.Headers);
         ImGui.TableNextColumn();
@@ -1766,18 +2546,20 @@ public class MainWindow : Window, IDisposable
                 ImGui.SetTooltip(column.Tooltip);
         }
 
-        for (var rowListIndex = 0; rowListIndex < snapshot.Rows.Count; rowListIndex++)
+        for (var rowListIndex = 0; rowListIndex < visibleRows.Count; rowListIndex++)
         {
-            var row = snapshot.Rows[rowListIndex];
+            var visibleRow = visibleRows[rowListIndex];
+            var row = visibleRow.Row;
+            var snapshotRowIndex = visibleRow.SnapshotRowIndex;
             ImGui.TableNextRow();
 
             ImGui.TableNextColumn();
-            if (ImGui.Selectable($"{row.RowIndex}##clientStructsRowIndex{rowListIndex}", selectedClientStructsPreviewRow == rowListIndex))
-                SelectClientStructsSheetCell(rowListIndex, selectedClientStructsPreviewColumn >= 0 ? selectedClientStructsPreviewColumn : 0);
+            if (ImGui.Selectable($"{row.RowIndex}##clientStructsRowIndex{rowListIndex}", selectedClientStructsPreviewRow == snapshotRowIndex))
+                SelectClientStructsSheetCell(snapshotRowIndex, selectedClientStructsPreviewColumn >= 0 ? selectedClientStructsPreviewColumn : 0);
 
             ImGui.TableNextColumn();
-            if (ImGui.Selectable($"{row.RowId}##clientStructsRowId{rowListIndex}", selectedClientStructsPreviewRow == rowListIndex))
-                SelectClientStructsSheetCell(rowListIndex, selectedClientStructsPreviewColumn >= 0 ? selectedClientStructsPreviewColumn : 0);
+            if (ImGui.Selectable($"{row.RowId}##clientStructsRowId{rowListIndex}", selectedClientStructsPreviewRow == snapshotRowIndex))
+                SelectClientStructsSheetCell(snapshotRowIndex, selectedClientStructsPreviewColumn >= 0 ? selectedClientStructsPreviewColumn : 0);
 
             for (var columnIndex = 0; columnIndex < row.Cells.Count; columnIndex++)
             {
@@ -1786,8 +2568,8 @@ public class MainWindow : Window, IDisposable
                 var display = TruncateSheetCellText(cell.DisplayText, 42);
 
                 ImGui.TableNextColumn();
-                if (ImGui.Selectable($"{display}##clientStructsCell{rowListIndex}_{columnIndex}", selectedClientStructsPreviewRow == rowListIndex && selectedClientStructsPreviewColumn == columnIndex))
-                    SelectClientStructsSheetCell(rowListIndex, columnIndex);
+                if (ImGui.Selectable($"{display}##clientStructsCell{rowListIndex}_{columnIndex}", selectedClientStructsPreviewRow == snapshotRowIndex && selectedClientStructsPreviewColumn == columnIndex))
+                    SelectClientStructsSheetCell(snapshotRowIndex, columnIndex);
 
                 if (ImGui.IsItemHovered())
                     ImGui.SetTooltip(BuildClientStructsCellTooltip(row, column, cell));
@@ -1853,6 +2635,43 @@ public class MainWindow : Window, IDisposable
             if (ImGui.IsItemClicked())
                 CopyAndNotify(column.Tooltip, "Field details");
         }
+    }
+
+    private List<(ClientStructsSheetRow Row, int SnapshotRowIndex)> GetVisibleClientStructsRows(ClientStructsSheetSnapshot snapshot)
+    {
+        var rows = new List<(ClientStructsSheetRow Row, int SnapshotRowIndex)>();
+        for (var i = 0; i < snapshot.Rows.Count; i++)
+        {
+            var row = snapshot.Rows[i];
+            if (MatchesClientStructsRowFilter(snapshot, row, clientStructsValueFilter))
+                rows.Add((row, i));
+        }
+
+        return rows;
+    }
+
+    private static bool MatchesClientStructsRowFilter(ClientStructsSheetSnapshot snapshot, ClientStructsSheetRow row, string filter)
+    {
+        if (string.IsNullOrWhiteSpace(filter))
+            return true;
+
+        if (row.RowIndex.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || row.RowId.ToString().Contains(filter, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        for (var columnIndex = 0; columnIndex < row.Cells.Count && columnIndex < snapshot.Columns.Count; columnIndex++)
+        {
+            var column = snapshot.Columns[columnIndex];
+            var cell = row.Cells[columnIndex];
+
+            if (column.Header.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                || column.Descriptor.Contains(filter, StringComparison.OrdinalIgnoreCase)
+                || (!string.IsNullOrEmpty(cell.DisplayText) && cell.DisplayText.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                || (!string.IsNullOrEmpty(cell.RawText) && cell.RawText.Contains(filter, StringComparison.OrdinalIgnoreCase)))
+                return true;
+        }
+
+        return false;
     }
 
     private void SelectClientStructsSheetCell(int rowListIndex, int columnIndex)
