@@ -367,6 +367,19 @@ public static class AddonInspector
     public static string FormatAtkValueEntry(AddonAtkValueInfo entry)
         => $"[{entry.Index}] {entry.TypeName} (raw:{entry.TypeRaw}) | {entry.Value} | Addr=0x{entry.Address:X}";
 
+    public static unsafe List<AddonAtkValueInfo> ScanAddonAtkValues(string addonName)
+    {
+        try
+        {
+            var addon = TryGetAddonByName(addonName);
+            return addon == null ? new List<AddonAtkValueInfo>() : ScanAtkValues(addon);
+        }
+        catch
+        {
+            return new List<AddonAtkValueInfo>();
+        }
+    }
+
     public static string FormatAddonLookupEntry(AddonLookupInstanceInfo entry)
     {
         var label = entry.Source.Equals("GameGui", StringComparison.OrdinalIgnoreCase)
@@ -888,7 +901,7 @@ public static class AddonInspector
                 AtkValueType.UInt => value->UInt.ToString(),
                 AtkValueType.Bool => (value->Byte != 0).ToString(),
                 AtkValueType.Pointer => $"0x{(nint)value->Pointer:X}",
-                AtkValueType.ManagedString or AtkValueType.String or AtkValueType.String8
+                AtkValueType.ManagedString or AtkValueType.String or AtkValueType.ConstString
                     => value->String.Value == null ? "null" : value->String.ToString() ?? string.Empty,
                 _ => $"Unhandled type {value->Type}"
             };

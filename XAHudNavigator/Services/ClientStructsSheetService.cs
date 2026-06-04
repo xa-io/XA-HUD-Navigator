@@ -61,6 +61,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         new ClientStructsSheetDefinition("Map Markers", "Map/UI", "Windowed active map-marker rows from AgentMap.", "var markers = ((AgentMap*)AgentModule.Instance()->GetAgentByInternalId(AgentId.Map))->MapMarkers;", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Event Markers", "Map/UI", "Windowed event-marker rows built by FateManager, EventFramework, and map runtime.", "var eventMarkers = ((AgentMap*)AgentModule.Instance()->GetAgentByInternalId(AgentId.Map))->EventMarkers;", SupportsWindowing: true),
         new ClientStructsSheetDefinition("InfoModule", "Social/UI", "InfoModule and InfoProxy availability state.", "var infoModule = InfoModule.Instance();"),
+        new ClientStructsSheetDefinition("Blacklist", "Social/UI", "Local client blacklist rows from InfoProxyBlacklist.", "var blacklist = (InfoProxyBlacklist*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.Blacklist);", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Linkshell", "Social/UI", "Normal Linkshell slots from InfoProxyLinkshell.", "var linkshell = (InfoProxyLinkshell*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.Linkshell);", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Cross-world Linkshell", "Social/UI", "Cross-world Linkshell slots from InfoProxyCrossWorldLinkshell.", "var cwls = (InfoProxyCrossWorldLinkshell*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.CrossWorldLinkshell);", SupportsWindowing: true),
         new ClientStructsSheetDefinition("Item Search Listings", "Market", "General marketboard listings cached in InfoProxyItemSearch.", "var itemSearch = (InfoProxyItemSearch*)InfoModule.Instance()->GetInfoProxyById(InfoProxyId.ItemSearch);", SupportsWindowing: true),
@@ -118,6 +119,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             "Map Markers" => ReadMapMarkers(definition, request),
             "Event Markers" => ReadEventMarkers(definition, request),
             "InfoModule" => ReadInfoModule(definition),
+            "Blacklist" => ReadBlacklist(definition, request),
             "Linkshell" => ReadLinkshell(definition, request),
             "Cross-world Linkshell" => ReadCrossWorldLinkshell(definition, request),
             "Item Search Listings" => ReadItemSearchListings(definition, request),
@@ -578,16 +580,20 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         var agentMap = TryGetAgentMap();
         var eventFramework = EventFramework.Instance();
         var publicContentDirector = eventFramework == null ? null : eventFramework->GetPublicContentDirector();
+        var hookStatusMessage = snapshot.HasCapturedPacket
+            ? $"Captured: {snapshot.CapturedAtUtc:yyyy-MM-dd HH:mm:ss} UTC"
+            : string.IsNullOrWhiteSpace(snapshot.HookUnavailableReason)
+                ? "No ZoneInit packet captured yet."
+                : $"ZoneInit hook unavailable: {snapshot.HookUnavailableReason}";
 
         return CreateSummarySnapshot(
             definition,
-            snapshot.HasCapturedPacket
-                ? $"Captured: {snapshot.CapturedAtUtc:yyyy-MM-dd HH:mm:ss} UTC"
-                : "No ZoneInit packet captured yet.",
+            hookStatusMessage,
             "Last raw ZoneInit packet observed by HUD Navigator.",
             new[]
             {
                 SummaryRow("HookActive", snapshot.HookActive, snapshot.HookActive, "Whether the plugin-level UIModule.HandlePacket hook for ZoneInit is active"),
+                SummaryRow("HookUnavailableReason", string.IsNullOrWhiteSpace(snapshot.HookUnavailableReason) ? string.Empty : snapshot.HookUnavailableReason, snapshot.HookUnavailableReason, "Reason the UIModule.HandlePacket hook was unavailable or failed to install"),
                 SummaryRow("HasCapturedPacket", snapshot.HasCapturedPacket, snapshot.HasCapturedPacket, "Whether a ZoneInit packet has been seen since the plugin loaded"),
                 SummaryRow("CapturedAtUtc", snapshot.HasCapturedPacket ? snapshot.CapturedAtUtc.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.CapturedAtUtc.ToString("O", CultureInfo.InvariantCulture) : string.Empty, "UTC timestamp of the last captured ZoneInit packet"),
                 SummaryRow("Dalamud.ClientState.Instance", snapshot.DalamudClientStateInstance, snapshot.DalamudClientStateInstance, "Dalamud client-state instance maintained from NetworkModuleProxy.SetCurrentInstance"),
@@ -1002,12 +1008,12 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("PublicContentEureka.LGBEventRange", eurekaPublicDirector == null ? 0 : eurekaPublicDirector->LGBEventRange, eurekaPublicDirector == null ? 0 : eurekaPublicDirector->LGBEventRange, "Eureka public-content event-range field"),
                 SummaryRow("PublicContentEureka.LGBPopRange", eurekaPublicDirector == null ? 0 : eurekaPublicDirector->LGBPopRange, eurekaPublicDirector == null ? 0 : eurekaPublicDirector->LGBPopRange, "Eureka public-content pop-range field"),
                 SummaryRow("PublicContentEureka.MaxElementalLevel", eurekaDirector == null ? 0 : eurekaDirector->MaxElementalLevel, eurekaDirector == null ? 0 : eurekaDirector->MaxElementalLevel, "Elemental sync cap announced by the Eureka director"),
-                SummaryRow("PublicContentEureka.CurrentExperience", eurekaDirector == null ? 0 : eurekaDirector->CurrentExperience, eurekaDirector == null ? 0 : eurekaDirector->CurrentExperience, "Current elemental experience"),
-                SummaryRow("PublicContentEureka.NeededExperience", eurekaDirector == null ? 0 : eurekaDirector->NeededExperience, eurekaDirector == null ? 0 : eurekaDirector->NeededExperience, "Experience needed for the next elemental level"),
-                SummaryRow("PublicContentEureka.MagiaAetherCharge", eurekaDirector == null ? 0 : eurekaDirector->MagiaAetherCharge, eurekaDirector == null ? 0 : eurekaDirector->MagiaAetherCharge, "Current magia aether charge"),
-                SummaryRow("PublicContentEureka.ElementalWheel", eurekaDirector == null ? "Unavailable" : $"Fire:{eurekaDirector->Fire} Ice:{eurekaDirector->Ice} Wind:{eurekaDirector->Wind} Earth:{eurekaDirector->Earth} Lightning:{eurekaDirector->Lightning} Water:{eurekaDirector->Water}", eurekaDirector == null ? string.Empty : $"{eurekaDirector->Fire},{eurekaDirector->Ice},{eurekaDirector->Wind},{eurekaDirector->Earth},{eurekaDirector->Lightning},{eurekaDirector->Water}", "Current magia board elemental allocation"),
-                SummaryRow("PublicContentEureka.Magicite", eurekaDirector == null ? 0 : eurekaDirector->Magicite, eurekaDirector == null ? 0 : eurekaDirector->Magicite, "Unlocked magicite count"),
-                SummaryRow("PublicContentEureka.MagiaAether", eurekaDirector == null ? 0 : eurekaDirector->MagiaAether, eurekaDirector == null ? 0 : eurekaDirector->MagiaAether, "Magia aether value")
+                SummaryRow("PublicContentEureka.CurrentExperience", eurekaDirector == null ? 0 : eurekaDirector->State.CurrentExperience, eurekaDirector == null ? 0 : eurekaDirector->State.CurrentExperience, "Current elemental experience"),
+                SummaryRow("PublicContentEureka.NeededExperience", eurekaDirector == null ? 0 : eurekaDirector->State.NeededExperience, eurekaDirector == null ? 0 : eurekaDirector->State.NeededExperience, "Experience needed for the next elemental level"),
+                SummaryRow("PublicContentEureka.MagiaAetherCharge", eurekaDirector == null ? 0 : eurekaDirector->State.MagiaAetherCharge, eurekaDirector == null ? 0 : eurekaDirector->State.MagiaAetherCharge, "Current magia aether charge"),
+                SummaryRow("PublicContentEureka.ElementalWheel", eurekaDirector == null ? "Unavailable" : $"Fire:{eurekaDirector->State.Fire} Ice:{eurekaDirector->State.Ice} Wind:{eurekaDirector->State.Wind} Earth:{eurekaDirector->State.Earth} Lightning:{eurekaDirector->State.Lightning} Water:{eurekaDirector->State.Water}", eurekaDirector == null ? string.Empty : $"{eurekaDirector->State.Fire},{eurekaDirector->State.Ice},{eurekaDirector->State.Wind},{eurekaDirector->State.Earth},{eurekaDirector->State.Lightning},{eurekaDirector->State.Water}", "Current magia board elemental allocation"),
+                SummaryRow("PublicContentEureka.Magicite", eurekaDirector == null ? 0 : eurekaDirector->State.Magicite, eurekaDirector == null ? 0 : eurekaDirector->State.Magicite, "Unlocked magicite count"),
+                SummaryRow("PublicContentEureka.MagiaAether", eurekaDirector == null ? 0 : eurekaDirector->State.MagiaAether, eurekaDirector == null ? 0 : eurekaDirector->State.MagiaAether, "Magia aether value")
             });
     }
 
@@ -1516,6 +1522,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         if (infoModule == null)
             return CreateEmptySnapshot(definition, "InfoModule.Instance() returned null.");
 
+        var blacklistAvailable = infoModule->GetInfoProxyById(InfoProxyId.Blacklist) != null;
         var linkshellAvailable = infoModule->GetInfoProxyById(InfoProxyId.Linkshell) != null;
         var crossWorldLinkshellAvailable = infoModule->GetInfoProxyById(InfoProxyId.CrossWorldLinkshell) != null;
         var itemSearchAvailable = infoModule->GetInfoProxyById(InfoProxyId.ItemSearch) != null;
@@ -1532,11 +1539,52 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("LocalCharName", infoModule->LocalCharName.ToString(), infoModule->LocalCharName.ToString(), "Utf8String local character name"),
                 SummaryRow("OnlineStatusFlags", infoModule->OnlineStatusFlags, infoModule->OnlineStatusFlags, "Raw online status bitmask"),
                 SummaryRow("IsInCrossWorldDuty()", infoModule->IsInCrossWorldDuty(), infoModule->IsInCrossWorldDuty(), "Cross-world duty helper"),
+                SummaryRow("BlacklistProxyLoaded", blacklistAvailable, blacklistAvailable, "GetInfoProxyById(Blacklist) != null"),
                 SummaryRow("LinkshellProxyLoaded", linkshellAvailable, linkshellAvailable, "GetInfoProxyById(Linkshell) != null"),
                 SummaryRow("CrossWorldLinkshellProxyLoaded", crossWorldLinkshellAvailable, crossWorldLinkshellAvailable, "GetInfoProxyById(CrossWorldLinkshell) != null"),
                 SummaryRow("ItemSearchProxyLoaded", itemSearchAvailable, itemSearchAvailable, "GetInfoProxyById(ItemSearch) != null"),
                 SummaryRow("FreeCompanyProxyLoaded", freeCompanyAvailable, freeCompanyAvailable, "GetInfoProxyById(FreeCompany) != null")
             });
+    }
+
+    private ClientStructsSheetSnapshot ReadBlacklist(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
+    {
+        var infoModule = InfoModule.Instance();
+        if (infoModule == null)
+            return CreateEmptySnapshot(definition, "InfoModule.Instance() returned null.");
+
+        var proxy = (InfoProxyBlacklist*)infoModule->GetInfoProxyById(InfoProxyId.Blacklist);
+        if (proxy == null)
+            return CreateEmptySnapshot(definition, "InfoProxyBlacklist is not loaded.");
+
+        var blockedCharacters = proxy->BlockedCharacters;
+        var totalRows = Math.Clamp(proxy->BlockedCharactersCount, 0, blockedCharacters.Length);
+        var columns = CreateColumns(
+            Column("Idx", "Index", "Visible blacklist cache index", 56f),
+            Column("Name", "CStringPointer", "Blocked character display name from InfoProxyBlacklist.BlockedCharacter.Name", 220f),
+            Column("AccountId", "ulong", "BlockedCharacter.Id as account id for current blacklist entries; ClientStructs notes old entries can be content id", 160f),
+            Column("Flag", "byte", "Raw BlockedCharacter.Flag value", 70f),
+            Column("IdNotes", "string", "ClientStructs interpretation for BlockedCharacter.Id", 260f));
+
+        var visibleRows = new List<ClientStructsSheetRow>();
+        BuildWindow(totalRows, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
+        for (var offset = 0; offset < rowsToLoad; offset++)
+        {
+            var rowIndex = startIndex + offset;
+            var entry = blockedCharacters[rowIndex];
+            var name = ReadCStringPointer(entry.Name);
+            visibleRows.Add(CreateRow(
+                rowIndex,
+                (uint)rowIndex,
+                Cell(rowIndex),
+                Cell(name, name),
+                Cell(entry.Id),
+                Cell(entry.Flag),
+                Cell("accountId for new entries; contentId for old entries", entry.Id)));
+        }
+
+        var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {totalRows} • BlockedCharactersCount: {proxy->BlockedCharactersCount}";
+        return CreateSnapshot(definition, columns, visibleRows, totalRows, startIndex, request.RowCount, $"Pointer: {FormatPointer(proxy)}", message);
     }
 
     private ClientStructsSheetSnapshot ReadLinkshell(ClientStructsSheetDefinition definition, ClientStructsSheetRequest request)
@@ -1865,6 +1913,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         if (group == null)
             return CreateEmptySnapshot(definition, "GroupManager has no active group.");
 
+        var blacklist = TryGetBlacklistProxy();
         var members = new List<(int Slot, bool AllianceEntry, nint MemberPointer)>();
         if (group->IsAlliance)
         {
@@ -1893,6 +1942,12 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             Column("Slot", "Index", "Party/alliance slot index", 56f),
             Column("Alliance", "bool", "True when the row came from alliance indexing", 72f),
             Column("ContentId", "ulong", "Character content id", 140f),
+            Column("AccountId", "ulong", "Character account id from PartyMember.AccountId", 140f),
+            Column("Blacklisted", "bool/string", "Whether AccountId/ContentId resolves through InfoProxyBlacklist.GetBlockResult", 100f),
+            Column("BlacklistResult", "enum", "InfoProxyBlacklist.BlockResultType for this party member", 140f),
+            Column("BlacklistIdx", "int", "Matched blacklist cache index when available", 95f),
+            Column("BlacklistName", "CStringPointer", "Matched blacklist name when available", 180f),
+            Column("BlacklistId", "ulong", "Matched blacklist entry id", 140f),
             Column("EntityId", "uint", "Character entity id", 110f),
             Column("Name", "string", "Party-member display name", 180f),
             Column("HomeWorld", "ushort", "Home world row id", 140f),
@@ -1915,12 +1970,19 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             var entry = members[rowIndex];
             var member = (PartyMember*)entry.MemberPointer;
             var name = member->NameOverride != null ? member->NameOverride->ToString() : member->NameString;
+            var blacklistMatch = GetBlacklistMatch(blacklist, member->AccountId, member->ContentId);
             visibleRows.Add(CreateRow(
                 rowIndex,
                 (uint)entry.Slot,
                 Cell(entry.Slot),
                 Cell(entry.AllianceEntry),
                 Cell(member->ContentId),
+                Cell(member->AccountId),
+                Cell(blacklistMatch.Status, blacklistMatch.IsBlocked),
+                Cell(blacklistMatch.ResultType, blacklistMatch.ResultType),
+                Cell(blacklistMatch.MatchIndex >= 0 ? blacklistMatch.MatchIndex.ToString(CultureInfo.InvariantCulture) : string.Empty, blacklistMatch.MatchIndex),
+                Cell(blacklistMatch.MatchName, blacklistMatch.MatchName),
+                Cell(blacklistMatch.MatchId == 0 ? string.Empty : blacklistMatch.MatchId.ToString(CultureInfo.InvariantCulture), blacklistMatch.MatchId),
                 Cell(member->EntityId),
                 Cell(name, member->ContentId),
                 Cell(ResolveWorldName(member->HomeWorld), member->HomeWorld),
@@ -1938,6 +2000,38 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
 
         var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {members.Count} - MemberCount: {group->MemberCount} - PartyLeaderIndex: {group->PartyLeaderIndex} - IsAlliance: {group->IsAlliance} - IsSmallGroupAlliance: {group->IsSmallGroupAlliance}";
         return CreateSnapshot(definition, columns, visibleRows, members.Count, startIndex, request.RowCount, $"Pointer: {FormatPointer(group)}", message);
+    }
+
+    private static InfoProxyBlacklist* TryGetBlacklistProxy()
+    {
+        var infoModule = InfoModule.Instance();
+        return infoModule == null ? null : (InfoProxyBlacklist*)infoModule->GetInfoProxyById(InfoProxyId.Blacklist);
+    }
+
+    private static PartyBlacklistMatch GetBlacklistMatch(InfoProxyBlacklist* blacklist, ulong accountId, ulong contentId)
+    {
+        if (blacklist == null)
+            return new PartyBlacklistMatch("Unavailable", false, "InfoProxyBlacklist unavailable", -1, string.Empty, 0);
+
+        if (accountId == 0 && contentId == 0)
+            return new PartyBlacklistMatch("False", false, "No account/content id", -1, string.Empty, 0);
+
+        InfoProxyBlacklist.BlockResult blockResult = default;
+        blacklist->GetBlockResult(&blockResult, accountId, contentId);
+
+        var isBlocked = blockResult.Type != InfoProxyBlacklist.BlockResultType.NotBlocked;
+        var matchName = blockResult.BlockedCharacterPtr == null
+            ? string.Empty
+            : ReadCStringPointer(blockResult.BlockedCharacterPtr->Name);
+        var matchId = blockResult.BlockedCharacterPtr == null ? 0 : blockResult.BlockedCharacterPtr->Id;
+
+        return new PartyBlacklistMatch(
+            isBlocked ? "True" : "False",
+            isBlocked,
+            blockResult.Type.ToString(),
+            blockResult.BlockedCharacterIndex,
+            matchName,
+            matchId);
     }
 
     private ClientStructsSheetSnapshot ReadActionManager(ClientStructsSheetDefinition definition)
@@ -2672,5 +2766,13 @@ public sealed class ClientStructsSearchResult
     public string RawText { get; set; } = string.Empty;
     public string DetailText { get; set; } = string.Empty;
 }
+
+public readonly record struct PartyBlacklistMatch(
+    string Status,
+    bool IsBlocked,
+    string ResultType,
+    int MatchIndex,
+    string MatchName,
+    ulong MatchId);
 
 public sealed record ClientStructsSummaryRow(string Field, string Value, string Raw, string Notes);

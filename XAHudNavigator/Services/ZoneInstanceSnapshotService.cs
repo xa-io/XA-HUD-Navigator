@@ -16,6 +16,7 @@ public sealed unsafe class ZoneInstanceSnapshotService : IDisposable
         snapshot = new ZoneInstanceSnapshot(
             HookActive: false,
             HasCapturedPacket: false,
+            HookUnavailableReason: string.Empty,
             CapturedAtUtc: DateTime.MinValue,
             DalamudClientStateInstance: Plugin.ClientState.Instance,
             ServerId: 0,
@@ -29,19 +30,36 @@ public sealed unsafe class ZoneInstanceSnapshotService : IDisposable
 
         try
         {
-            if (UIModule.StaticVirtualTablePointer == null)
+            var vtable = UIModule.StaticVirtualTablePointer;
+            if (vtable == null)
             {
-                Plugin.Log.Warning("[XAHudNavigator] Could not start zone-init packet hook because UIModule.StaticVirtualTablePointer was null.");
+                SetHookUnavailable("UIModule.StaticVirtualTablePointer was null.");
+                return;
+            }
+
+            var handlePacketAddress = (nint)vtable->HandlePacket;
+            if (handlePacketAddress == nint.Zero)
+            {
+                SetHookUnavailable("UIModule.HandlePacket vtable entry was unavailable.");
                 return;
             }
 
             uiModuleHandlePacketHook = Plugin.HookProvider.HookFromAddress<UIModule.Delegates.HandlePacket>(
-                (nint)UIModule.StaticVirtualTablePointer->HandlePacket,
+                handlePacketAddress,
                 UIModuleHandlePacketDetour);
             uiModuleHandlePacketHook.Enable();
+            lock (gate)
+            {
+                snapshot = snapshot with
+                {
+                    HookActive = true,
+                    HookUnavailableReason = string.Empty
+                };
+            }
         }
         catch (Exception ex)
         {
+            SetHookUnavailable($"Failed to install UIModule.HandlePacket hook: {ex.GetType().Name}: {ex.Message}");
             Plugin.Log.Warning(ex, "[XAHudNavigator] Failed to install the zone-init packet hook.");
         }
     }
@@ -52,7 +70,7 @@ public sealed unsafe class ZoneInstanceSnapshotService : IDisposable
         {
             return snapshot with
             {
-                HookActive = uiModuleHandlePacketHook != null,
+                HookActive = uiModuleHandlePacketHook != null && string.IsNullOrWhiteSpace(snapshot.HookUnavailableReason),
                 DalamudClientStateInstance = Plugin.ClientState.Instance
             };
         }
@@ -77,6 +95,7 @@ public sealed unsafe class ZoneInstanceSnapshotService : IDisposable
             snapshot = new ZoneInstanceSnapshot(
                 HookActive: true,
                 HasCapturedPacket: true,
+                HookUnavailableReason: string.Empty,
                 CapturedAtUtc: DateTime.UtcNow,
                 DalamudClientStateInstance: Plugin.ClientState.Instance,
                 ServerId: zoneInitPacket->ServerId,
@@ -89,11 +108,26 @@ public sealed unsafe class ZoneInstanceSnapshotService : IDisposable
                 Flags: zoneInitPacket->Flags);
         }
     }
+
+    private void SetHookUnavailable(string reason)
+    {
+        lock (gate)
+        {
+            snapshot = snapshot with
+            {
+                HookActive = false,
+                HookUnavailableReason = reason
+            };
+        }
+
+        Plugin.Log.Warning($"[XAHudNavigator] Zone-init packet hook unavailable: {reason}");
+    }
 }
 
 public readonly record struct ZoneInstanceSnapshot(
     bool HookActive,
     bool HasCapturedPacket,
+    string HookUnavailableReason,
     DateTime CapturedAtUtc,
     uint DalamudClientStateInstance,
     ushort ServerId,

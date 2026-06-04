@@ -25,6 +25,7 @@ public class MainWindow : Window, IDisposable
 {
     private readonly Plugin plugin;
     private const string PluginVersion = BuildInfo.Version;
+    private const int MaxClickLogEntries = 1000;
     private static float UiScale => ImGuiHelpers.GlobalScale;
 
     // Cached addon scan results
@@ -100,7 +101,7 @@ public class MainWindow : Window, IDisposable
         : base("XA HUD Navigator##XAHudNavigator", ImGuiWindowFlags.None)
     {
         this.plugin = plugin;
-        UpdateSizeConstraints(ImGuiHelpers.GlobalScaleSafe);
+        UpdateSizeConstraints(ImGuiHelpers.GlobalScale);
     }
 
     public override void PreDraw()
@@ -216,9 +217,12 @@ public class MainWindow : Window, IDisposable
         {
             if (clickTrackMode)
             {
-                clickLog.Add($"[{DateTime.Now:HH:mm:ss}] Logging enabled — interact with game UI to log events");
                 // Snapshot current visible addons and hook Framework for change detection
-                previousVisibleAddons = new HashSet<string>(cachedAddons.Where(a => a.IsVisible).Select(a => a.Name));
+                var visibleAddons = AddonInspector.ScanAllAddons().Where(a => a.IsVisible).ToList();
+                previousVisibleAddons = new HashSet<string>(visibleAddons.Select(a => a.Name));
+                AddClickLogEntry($"[{DateTime.Now:HH:mm:ss}] Logging enabled — interact with game UI to log events");
+                foreach (var addon in visibleAddons)
+                    AddAtkValueLogEntries("VISIBLE", addon.Name, addon.NodeCount);
                 if (!clickTrackFrameworkHooked)
                 {
                     Plugin.Framework.Update += OnClickTrackTick;
@@ -3111,9 +3115,8 @@ public class MainWindow : Window, IDisposable
     /// <summary>Called by the overlay when it detects a game-side click during track mode.</summary>
     public void LogClick(string addonName, int nodeIndex, string nodeType)
     {
-        var entry = $"[{DateTime.Now:HH:mm:ss}] {addonName} → [{nodeIndex}] {nodeType}";
-        clickLog.Add(entry);
-        if (clickLog.Count > 200) clickLog.RemoveAt(0);
+        AddClickLogEntry($"[{DateTime.Now:HH:mm:ss}] {addonName} → [{nodeIndex}] {nodeType}");
+        AddAtkValueLogEntries("CLICK", addonName);
     }
 
     public bool IsClickTrackMode => clickTrackMode;
@@ -3149,8 +3152,7 @@ public class MainWindow : Window, IDisposable
                 {
                     var addonInfo = currentAddons.FirstOrDefault(a => a.Name == name);
                     var nodeCount = addonInfo?.NodeCount ?? 0;
-                    clickLog.Add($"[{DateTime.Now:HH:mm:ss}] APPEARED: {name} [{nodeCount} nodes]");
-                    if (clickLog.Count > 200) clickLog.RemoveAt(0);
+                    AddAtkValueLogEntries("APPEARED", name, nodeCount);
                 }
             }
 
@@ -3159,14 +3161,31 @@ public class MainWindow : Window, IDisposable
             {
                 if (!currentVisible.Contains(name))
                 {
-                    clickLog.Add($"[{DateTime.Now:HH:mm:ss}] CLOSED: {name}");
-                    if (clickLog.Count > 200) clickLog.RemoveAt(0);
+                    AddClickLogEntry($"[{DateTime.Now:HH:mm:ss}] CLOSED: {name}");
                 }
             }
 
             previousVisibleAddons = currentVisible;
         }
         catch { /* ignore scan errors during tracking */ }
+    }
+
+    private void AddAtkValueLogEntries(string eventName, string addonName, int? nodeCount = null)
+    {
+        var atkValues = AddonInspector.ScanAddonAtkValues(addonName);
+        var nodeText = nodeCount.HasValue ? $" [{nodeCount.Value} nodes" : string.Empty;
+        var closeNodeText = nodeCount.HasValue ? $", AtkValues {atkValues.Count}]" : $" [AtkValues {atkValues.Count}]";
+
+        AddClickLogEntry($"[{DateTime.Now:HH:mm:ss}] {eventName}: {addonName}{nodeText}{closeNodeText}");
+        foreach (var atkValue in atkValues)
+            AddClickLogEntry($"    {AddonInspector.FormatAtkValueEntry(atkValue)}");
+    }
+
+    private void AddClickLogEntry(string entry)
+    {
+        clickLog.Add(entry);
+        while (clickLog.Count > MaxClickLogEntries)
+            clickLog.RemoveAt(0);
     }
 
 }
