@@ -101,6 +101,7 @@ public class MainWindow : Window, IDisposable
         : base("XA HUD Navigator##XAHudNavigator", ImGuiWindowFlags.None)
     {
         this.plugin = plugin;
+        InhibitAtkCollision = true;
         UpdateSizeConstraints(ImGuiHelpers.GlobalScale);
     }
 
@@ -358,7 +359,7 @@ public class MainWindow : Window, IDisposable
         var filtered = cachedAddons
             .Where(a => string.IsNullOrEmpty(searchFilter)
                 || a.Name.Contains(searchFilter, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(a => a.IsFocused)
+            .OrderByDescending(a => a.IsVisible && a.IsFocused)
             .ThenByDescending(a => a.IsVisible)
             .ThenBy(a => a.Name)
             .ToList();
@@ -369,7 +370,7 @@ public class MainWindow : Window, IDisposable
 
             // Color: focused = bright green, visible = white, hidden = grey
             Vector4 color;
-            if (addon.IsFocused)
+            if (addon.IsVisible && addon.IsFocused)
                 color = new Vector4(0.2f, 1f, 0.2f, 1f);
             else if (addon.IsVisible)
                 color = new Vector4(1f, 1f, 1f, 1f);
@@ -3141,7 +3142,7 @@ public class MainWindow : Window, IDisposable
             {
                 if (a.IsVisible)
                     currentVisible.Add(a.Name);
-                if (a.IsFocused)
+                if (a.IsVisible && a.IsFocused)
                     currentFocused = a.Name;
             }
 

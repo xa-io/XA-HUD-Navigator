@@ -41,7 +41,8 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open the XA HUD Navigator window"
+            HelpMessage = "Open the XA HUD Navigator window",
+            AllowedInMacros = true,
         });
 
         PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
@@ -84,5 +85,5 @@ public sealed class Plugin : IDalamudPlugin
 
 internal static class BuildInfo
 {
-    public const string Version = "0.0.0.6";
+    public const string Version = "0.0.0.7";
 }

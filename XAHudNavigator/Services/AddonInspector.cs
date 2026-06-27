@@ -171,8 +171,15 @@ public static class AddonInspector
             if (unitManager == null) return results;
 
             // Get the focused addon for highlighting
-            var focusedAddon = unitManager->GetAddonByName("") == null ? null : (AtkUnitBase*)null;
-            try { focusedAddon = unitManager->AtkUnitManager.FocusedUnitsList.Entries[0].Value; } catch { }
+            AtkUnitBase* focusedAddon = null;
+            try
+            {
+                focusedAddon = unitManager->AtkUnitManager.FocusedUnitsList.Entries[0].Value;
+            }
+            catch
+            {
+                focusedAddon = null;
+            }
 
             var allLoadedList = &unitManager->AtkUnitManager.AllLoadedUnitsList;
             if (allLoadedList == null) return results;
@@ -779,7 +786,7 @@ public static class AddonInspector
             try
             {
                 var addonHandle = Plugin.GameGui.GetAddonByName(addonName, index);
-                if (addonHandle.IsNull)
+                if (addonHandle.IsNull || addonHandle.Address == nint.Zero)
                     continue;
 
                 var addon = (AtkUnitBase*)addonHandle.Address;
@@ -839,8 +846,12 @@ public static class AddonInspector
         try
         {
             var visibleAddon = Plugin.GameGui.GetAddonByName(addonName, 1);
-            if (!visibleAddon.IsNull)
-                return (AtkUnitBase*)visibleAddon.Address;
+            if (!visibleAddon.IsNull && visibleAddon.Address != nint.Zero)
+            {
+                var addon = (AtkUnitBase*)visibleAddon.Address;
+                if (addon != null)
+                    return addon;
+            }
         }
         catch
         {
@@ -856,7 +867,8 @@ public static class AddonInspector
             if (unitManager == null)
                 return null;
 
-            return unitManager->GetAddonByName(addonName);
+            var addon = unitManager->GetAddonByName(addonName);
+            return addon == null ? null : addon;
         }
         catch
         {

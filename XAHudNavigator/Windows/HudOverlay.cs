@@ -39,6 +39,7 @@ public class HudOverlay : Window, IDisposable
         this.plugin = plugin;
         IsOpen = true;
         RespectCloseHotkey = false;
+        InhibitAtkCollision = false;
         Position = Vector2.Zero;
         PositionCondition = ImGuiCond.Always;
     }

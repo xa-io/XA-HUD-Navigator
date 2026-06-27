@@ -78,8 +78,23 @@ public sealed unsafe class ZoneInstanceSnapshotService : IDisposable
 
     public void Dispose()
     {
-        uiModuleHandlePacketHook?.Dispose();
-        uiModuleHandlePacketHook = null;
+        lock (gate)
+        {
+            snapshot = snapshot with
+            {
+                HookActive = false,
+                HookUnavailableReason = "Disposed."
+            };
+        }
+
+        try
+        {
+            uiModuleHandlePacketHook?.Dispose();
+        }
+        finally
+        {
+            uiModuleHandlePacketHook = null;
+        }
     }
 
     private void UIModuleHandlePacketDetour(UIModule* thisPtr, UIModulePacketType type, uint uintParam, void* packet)
