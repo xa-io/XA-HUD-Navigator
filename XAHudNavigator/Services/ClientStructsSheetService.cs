@@ -90,8 +90,10 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         if (definition == null)
             return CreateEmptySnapshot(new ClientStructsSheetDefinition(name, "Unknown", "Unknown runtime sheet.", string.Empty), "Unknown ClientStructs sheet.");
 
-        return definition.Name switch
+        try
         {
+            return definition.Name switch
+            {
             "GameMain" => ReadGameMain(definition),
             "PlayerState" => ReadPlayerState(definition),
             "UIState" => ReadUIState(definition),
@@ -131,8 +133,15 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             "Party Members" => ReadPartyMembers(definition, request),
             "ActionManager" => ReadActionManager(definition),
             "TargetSystem" => ReadTargetSystem(definition),
-            _ => CreateEmptySnapshot(definition, $"{definition.Name} is not implemented.")
-        };
+                _ => CreateEmptySnapshot(definition, $"{definition.Name} is not implemented.")
+            };
+        }
+        catch (Exception ex)
+        {
+            return CreateEmptySnapshot(
+                definition,
+                $"{definition.Name} is unavailable because its live ClientStructs read failed ({ex.GetType().Name}: {ex.Message}).");
+        }
     }
 
     public List<ClientStructsSearchResult> SearchAllSheets(string filter, ClientStructsSheetRequest request, int maxResults = 300)

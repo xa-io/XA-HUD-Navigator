@@ -26,6 +26,7 @@ public sealed class Plugin : IDalamudPlugin
     public readonly WindowSystem WindowSystem = new("XAHudNavigator");
     private MainWindow MainWindow { get; init; }
     private HudOverlay HudOverlay { get; init; }
+    private bool disposed;
 
     public MainWindow GetMainWindow() => MainWindow;
 
@@ -54,19 +55,38 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
-        PluginInterface.UiBuilder.Draw -= WindowSystem.Draw;
-        PluginInterface.UiBuilder.OpenConfigUi -= ToggleMainUi;
-        PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi;
+        if (disposed)
+            return;
 
-        WindowSystem.RemoveAllWindows();
-        MainWindow.Dispose();
-        HudOverlay.Dispose();
+        disposed = true;
 
-        CommandManager.RemoveHandler(CommandName);
+        // Detach all public entry points before releasing the native inspector and window owners.
+        TryCleanup("UiBuilder.Draw -= WindowSystem.Draw", () => PluginInterface.UiBuilder.Draw -= WindowSystem.Draw);
+        TryCleanup("UiBuilder.OpenConfigUi -= ToggleMainUi", () => PluginInterface.UiBuilder.OpenConfigUi -= ToggleMainUi);
+        TryCleanup("UiBuilder.OpenMainUi -= ToggleMainUi", () => PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUi);
+        TryCleanup($"CommandManager.RemoveHandler({CommandName})", () => CommandManager.RemoveHandler(CommandName));
+        TryCleanup("WindowSystem.RemoveAllWindows", WindowSystem.RemoveAllWindows);
+        TryCleanup("MainWindow.Dispose", MainWindow.Dispose);
+        TryCleanup("HudOverlay.Dispose", HudOverlay.Dispose);
+    }
+
+    private static void TryCleanup(string label, Action cleanup)
+    {
+        try
+        {
+            cleanup();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, $"[XAHudNavigator] Dispose cleanup failed for {label}.");
+        }
     }
 
     private void OnCommand(string command, string args)
     {
+        if (disposed)
+            return;
+
         var trimmed = args.Trim().ToLowerInvariant();
 
         if (trimmed == "overlay")
@@ -80,10 +100,14 @@ public sealed class Plugin : IDalamudPlugin
         MainWindow.Toggle();
     }
 
-    public void ToggleMainUi() => MainWindow.Toggle();
+    public void ToggleMainUi()
+    {
+        if (!disposed)
+            MainWindow.Toggle();
+    }
 }
 
 internal static class BuildInfo
 {
-    public const string Version = "0.0.0.7";
+    public const string Version = "0.0.0.8";
 }
