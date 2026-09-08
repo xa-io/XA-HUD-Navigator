@@ -29,8 +29,7 @@ public class MainWindow : Window, IDisposable
     private static float UiScale => ImGuiHelpers.GlobalScale;
 
     // Cached addon scan results
-    private List<AddonInfo> cachedAddons = new();
-    private DateTime lastRefresh = DateTime.MinValue;
+    private IReadOnlyList<AddonInfo> cachedAddons = Array.Empty<AddonInfo>();
     private string searchFilter = string.Empty;
     private string? selectedAddonName;
     private int selectedNodeIndex = -1;
@@ -40,6 +39,7 @@ public class MainWindow : Window, IDisposable
     private readonly List<string> clickLog = new();
     private HashSet<string> previousVisibleAddons = new();
     private bool clickTrackFrameworkHooked;
+    private long lastLoggingFrameNumber;
     private bool switchToLoggingTab;
     private bool switchToDebugTab;
     private bool switchToSheetsTab;
@@ -52,7 +52,6 @@ public class MainWindow : Window, IDisposable
     private string? cachedDebugAddonName;
 
     // Hover state — which node row is hovered in the table (for overlay pulsation)
-    private int hoveredNodeIndex = -1;
 
     // Sheets tab
     private readonly ExdSchemaService exdSchemaService = new();
@@ -124,19 +123,15 @@ public class MainWindow : Window, IDisposable
     private void CopyAndNotify(string text, string label = "")
     {
         ImGui.SetClipboardText(text);
-        copiedFeedback = string.IsNullOrEmpty(label) ? $"Copied: {(text.Length > 60 ? text[..60] + "..." : text)}" : $"Copied: {label}";
+        copiedFeedback = string.IsNullOrEmpty(label)
+            ? $"Copied: {TextDisplay.Truncate(text, 60, string.Empty)}"
+            : $"Copied: {label}";
         copiedExpiry = DateTime.UtcNow.AddSeconds(3);
     }
 
     public override void Draw()
     {
-        // Auto-refresh
-        var now = DateTime.UtcNow;
-        if ((float)(now - lastRefresh).TotalSeconds >= plugin.Configuration.RefreshInterval)
-        {
-            cachedAddons = AddonInspector.ScanAllAddons();
-            lastRefresh = now;
-        }
+        cachedAddons = plugin.AddonSnapshots.Current.Addons;
 
         // ── Top bar ──
         DrawTopBar();
@@ -218,8 +213,10 @@ public class MainWindow : Window, IDisposable
         {
             if (clickTrackMode)
             {
-                // Snapshot current visible addons and hook Framework for change detection
-                var visibleAddons = AddonInspector.ScanAllAddons().Where(a => a.IsVisible).ToList();
+                // Start from the same published frame used by the Addons workspace and overlay.
+                var frame = plugin.AddonSnapshots.Current;
+                lastLoggingFrameNumber = frame.FrameNumber;
+                var visibleAddons = frame.Addons.Where(a => a.IsVisible).ToList();
                 previousVisibleAddons = new HashSet<string>(visibleAddons.Select(a => a.Name));
                 AddClickLogEntry($"[{DateTime.Now:HH:mm:ss}] Logging enabled — interact with game UI to log events");
                 foreach (var addon in visibleAddons)
@@ -274,8 +271,7 @@ public class MainWindow : Window, IDisposable
         ImGui.SameLine();
         if (ImGui.Button("Refresh"))
         {
-            cachedAddons = AddonInspector.ScanAllAddons();
-            lastRefresh = DateTime.UtcNow;
+            plugin.AddonSnapshots.RequestRefresh();
             cachedDebugSnapshot = null;
             cachedDebugAddonName = null;
         }
@@ -383,6 +379,7 @@ public class MainWindow : Window, IDisposable
             {
                 selectedAddonName = addon.Name;
                 selectedNodeIndex = -1;
+                plugin.AddonSnapshots.SetSelection(selectedAddonName, selectedNodeIndex);
                 cachedDebugSnapshot = null;
                 cachedDebugAddonName = null;
             }
@@ -421,19 +418,11 @@ public class MainWindow : Window, IDisposable
             return;
         }
 
-        // Deep scan the selected addon for fresh data
         var addon = cachedAddons.FirstOrDefault(a => a.Name == selectedAddonName);
         if (addon == null)
         {
             ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), $"'{selectedAddonName}' not found.");
             return;
-        }
-
-        // If not visible, try deep scan to get nodes
-        if (addon.Nodes.Count == 0 && addon.NodeCount > 0)
-        {
-            var deep = AddonInspector.ScanSingleAddon(selectedAddonName);
-            if (deep != null) addon = deep;
         }
 
         // Header
@@ -471,7 +460,7 @@ public class MainWindow : Window, IDisposable
         ImGui.Spacing();
 
         // Reset hover state each frame — will be set if a row is hovered
-        hoveredNodeIndex = -1;
+        plugin.AddonSnapshots.SetHoveredNodeIndex(-1);
 
         // Node table
         if (ImGui.BeginTable("Nodes", 8,
@@ -498,6 +487,7 @@ public class MainWindow : Window, IDisposable
                 if (ImGui.Selectable($"{node.Index}##n{node.Index}", isNodeSel, ImGuiSelectableFlags.SpanAllColumns))
                 {
                     selectedNodeIndex = node.Index;
+                    plugin.AddonSnapshots.SetSelection(selectedAddonName, selectedNodeIndex);
                     var copyLine = $"[{node.Index}] NodeId={node.NodeId} Type={node.TypeDisplay} (raw:{node.TypeRaw})";
                     if (!string.IsNullOrEmpty(node.Text)) copyLine += $" \"{node.Text}\"";
                     if (node.IsInteractive) copyLine += " [INTERACTIVE]";
@@ -505,7 +495,7 @@ public class MainWindow : Window, IDisposable
                 }
                 // Track hover for overlay pulsation
                 if (ImGui.IsItemHovered())
-                    hoveredNodeIndex = node.Index;
+                    plugin.AddonSnapshots.SetHoveredNodeIndex(node.Index);
 
                 // NodeId
                 ImGui.TableNextColumn();
@@ -537,7 +527,7 @@ public class MainWindow : Window, IDisposable
                 ImGui.TableNextColumn();
                 if (!string.IsNullOrEmpty(node.Text))
                 {
-                    var t = node.Text.Length > 35 ? node.Text[..35] + "..." : node.Text;
+                    var t = TextDisplay.Truncate(node.Text, 35, string.Empty);
                     ImGui.TextColored(new Vector4(1f, 0.9f, 0.6f, 1f), t);
                     if (ImGui.IsItemHovered() && node.Text.Length > 35)
                         ImGui.SetTooltip(node.Text);
@@ -573,14 +563,21 @@ public class MainWindow : Window, IDisposable
         }
 
         var addon = cachedAddons.FirstOrDefault(a => a.Name == selectedAddonName);
-        if (addon == null || selectedNodeIndex >= addon.Nodes.Count)
+        var n = addon == null
+            ? null
+            : NodeProjection.FindByNativeIndex(addon.Nodes, node => node.Index, selectedNodeIndex);
+        if (addon == null || n == null)
         {
             ImGui.TextDisabled("Node not available.");
             return;
         }
 
-        var n = addon.Nodes[selectedNodeIndex];
-        var runtimeReport = AddonInspector.BuildNodeRuntimeReport(addon.Name, n.Index);
+        var frame = plugin.AddonSnapshots.Current;
+        var runtimeReport = frame.SelectedNodeRuntime is { } candidate
+            && string.Equals(candidate.AddonName, selectedAddonName, StringComparison.Ordinal)
+            && candidate.NodeIndex == selectedNodeIndex
+                ? candidate
+                : null;
 
         // ── Node Detail Section (~20 lines height) ──
         var lineH = ImGui.GetTextLineHeightWithSpacing();
@@ -3122,28 +3119,30 @@ public class MainWindow : Window, IDisposable
 
     public bool IsClickTrackMode => clickTrackMode;
     public string? SelectedAddonName => selectedAddonName;
-    public int HoveredNodeIndex => hoveredNodeIndex;
+    public int HoveredNodeIndex => plugin.AddonSnapshots.HoveredNodeIndex;
 
     /// <summary>
     /// Framework.Update callback — polls visible addons and detects appear/disappear/focus changes.
     /// Fires once per frame while click tracking is enabled.
     /// </summary>
-    private void OnClickTrackTick(IFramework fw)
+    private void OnClickTrackTick(IFramework _)
     {
         if (!clickTrackMode) return;
 
         try
         {
-            var currentAddons = AddonInspector.ScanAllAddons();
+            var frame = plugin.AddonSnapshots.Current;
+            if (frame.FrameNumber == 0 || frame.FrameNumber == lastLoggingFrameNumber)
+                return;
+
+            lastLoggingFrameNumber = frame.FrameNumber;
+            var currentAddons = frame.Addons;
             var currentVisible = new HashSet<string>();
-            string? currentFocused = null;
 
             foreach (var a in currentAddons)
             {
                 if (a.IsVisible)
                     currentVisible.Add(a.Name);
-                if (a.IsVisible && a.IsFocused)
-                    currentFocused = a.Name;
             }
 
             // Detect newly appeared addons
@@ -3168,7 +3167,10 @@ public class MainWindow : Window, IDisposable
 
             previousVisibleAddons = currentVisible;
         }
-        catch { /* ignore scan errors during tracking */ }
+        catch (Exception ex)
+        {
+            DiagnosticLog.VerboseThrottled("MainWindow.OnClickTrackTick", ex);
+        }
     }
 
     private void AddAtkValueLogEntries(string eventName, string addonName, int? nodeCount = null)

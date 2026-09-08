@@ -13,17 +13,17 @@ namespace XAHudNavigator.Windows;
 /// Only draws nodes for the SELECTED addon (not all addons) to avoid clutter.
 /// Optionally shows a mouse-hover tooltip with addon/node info.
 /// </summary>
-public class HudOverlay : Window, IDisposable
+public sealed class HudOverlay : Window, IDisposable
 {
     private readonly Plugin plugin;
     private static float UiScale => ImGuiHelpers.GlobalScale;
 
-    private static readonly uint AddonOutlineColor = 0xFF00FFFF;  // cyan
+    private static readonly uint AddonOutlineColor = 0xFFFFFF00;  // cyan
     private static readonly uint InteractiveColor = 0xFF00FF00;   // bright green
-    private static readonly uint TextNodeColor = 0xFFFFCC44;      // gold
+    private static readonly uint TextNodeColor = 0xFF44CCFF;      // gold
     private static readonly uint NonInteractiveColor = 0xFF888888; // grey
     private static readonly uint LabelBgColor = 0xCC000000;       // semi-transparent black
-    private static readonly uint HoverColor = 0xFFFF8800;         // orange
+    private static readonly uint HoverColor = 0xFF0088FF;         // orange
 
     public HudOverlay(Plugin plugin)
         : base("XA HUD Navigator Overlay##XAHudNavigatorOverlay",
@@ -49,7 +49,7 @@ public class HudOverlay : Window, IDisposable
     public override void PreDraw()
     {
         var io = ImGui.GetIO();
-        Size = io.DisplaySize;
+        Size = io.DisplaySize / ImGuiHelpers.GlobalScale;
         SizeCondition = ImGuiCond.Always;
     }
 
@@ -57,15 +57,12 @@ public class HudOverlay : Window, IDisposable
     {
         if (!plugin.Configuration.OverlayEnabled) return;
 
-        var mainWindow = plugin.GetMainWindow();
-        var selectedAddonName = mainWindow?.SelectedAddonName;
+        var selectedAddon = plugin.AddonSnapshots.Current.SelectedAddon;
 
-        // Only draw for the selected addon to avoid the clutter seen in screenshots
-        AddonInfo? selectedAddon = null;
-        if (!string.IsNullOrEmpty(selectedAddonName))
-            selectedAddon = AddonInspector.ScanSingleAddon(selectedAddonName);
-
-        if (selectedAddon == null || !selectedAddon.IsVisible) return;
+        if (selectedAddon == null
+            || !selectedAddon.IsVisible
+            || !OverlayGeometry.HasFinitePositiveRect(selectedAddon.Position, selectedAddon.Size))
+            return;
 
         var drawList = ImGui.GetForegroundDrawList();
         var showBoxes = plugin.Configuration.OverlayShowBoundingBoxes;
@@ -74,11 +71,11 @@ public class HudOverlay : Window, IDisposable
         var interactiveOnly = plugin.Configuration.OverlayShowInteractiveOnly;
 
         // If ALL drawing options are off, draw nothing (no clutter)
-        if (!showBoxes && !showIds && !showNames && !interactiveOnly)
+        if (!showBoxes && !showIds && !showNames)
             return;
 
         // Draw addon bounding box
-        if (showBoxes && selectedAddon.Size.X > 0 && selectedAddon.Size.Y > 0)
+        if (showBoxes)
         {
             var addonMin = selectedAddon.Position;
             var addonMax = selectedAddon.Position + selectedAddon.Size;
@@ -100,15 +97,13 @@ public class HudOverlay : Window, IDisposable
             return;
 
         // Get hovered node index from main window for pulsation
-        var hoveredIdx = mainWindow?.HoveredNodeIndex ?? -1;
+        var hoveredIdx = plugin.AddonSnapshots.HoveredNodeIndex;
         var pulseAlpha = (float)(0.5 + 0.5 * Math.Sin(DateTime.UtcNow.TimeOfDay.TotalSeconds * 6.0)); // pulsate ~1Hz
 
         // Draw node outlines for selected addon only
         foreach (var node in selectedAddon.Nodes)
         {
-            if (!node.IsVisible) continue;
-            if (node.Size.X <= 0 || node.Size.Y <= 0) continue;
-            if (interactiveOnly && !node.IsInteractive) continue;
+            if (!OverlayGeometry.ShouldDrawNode(node, interactiveOnly)) continue;
 
             var nodeMin = node.ScreenPosition;
             var nodeMax = nodeMin + node.Size;
@@ -117,11 +112,11 @@ public class HudOverlay : Window, IDisposable
             if (hoveredIdx == node.Index)
             {
                 var pulseByte = (uint)(byte)(255 * pulseAlpha);
-                var pulseColor = 0xFF000000u | (pulseByte << 16) | (pulseByte << 8) | 0xFFu; // pulsating cyan
+                var pulseColor = 0xFF000000u | (pulseByte << 16) | (pulseByte << 8); // pulsating cyan
                 drawList.AddRect(nodeMin, nodeMax, pulseColor, 0, ImDrawFlags.None, Scale(3.0f));
                 // Filled highlight with low alpha
                 var fillAlpha = (byte)(60 * pulseAlpha);
-                var fillColor = (uint)((fillAlpha << 24) | 0x00FFFF);
+                var fillColor = (uint)((fillAlpha << 24) | 0x00FFFF00);
                 drawList.AddRectFilled(nodeMin, nodeMax, fillColor);
                 // Always show label for pulsating node
                 var pulseLabel = $"[{node.Index}] {node.TypeDisplay}";
@@ -166,19 +161,11 @@ public class HudOverlay : Window, IDisposable
         if (mousePos.X >= selectedAddon.Position.X && mousePos.X <= selectedAddon.Position.X + selectedAddon.Size.X &&
             mousePos.Y >= selectedAddon.Position.Y && mousePos.Y <= selectedAddon.Position.Y + selectedAddon.Size.Y)
         {
-            // Find the node under the mouse
-            NodeInfo? hoveredNode = null;
-            foreach (var node in selectedAddon.Nodes)
-            {
-                if (!node.IsVisible || node.Size.X <= 0 || node.Size.Y <= 0) continue;
-                var nMin = node.ScreenPosition;
-                var nMax = nMin + node.Size;
-                if (mousePos.X >= nMin.X && mousePos.X <= nMax.X && mousePos.Y >= nMin.Y && mousePos.Y <= nMax.Y)
-                {
-                    hoveredNode = node;
-                    break; // first match (top-most in list order)
-                }
-            }
+            // Resolve in reverse draw order so overlapping nodes select the top-most entry.
+            var hoveredNode = OverlayGeometry.FindHoveredNode(
+                selectedAddon.Nodes,
+                mousePos,
+                interactiveOnly);
 
             if (hoveredNode != null)
             {
@@ -195,7 +182,7 @@ public class HudOverlay : Window, IDisposable
                     $"NodeId: {hoveredNode.NodeId}  Raw: {hoveredNode.TypeRaw}",
                     $"Pos: ({hoveredNode.Position.X:F0},{hoveredNode.Position.Y:F0})  Size: {hoveredNode.Size.X:F0}x{hoveredNode.Size.Y:F0}",
                     hoveredNode.IsInteractive ? "INTERACTIVE" : "",
-                    !string.IsNullOrEmpty(hoveredNode.Text) ? $"\"{(hoveredNode.Text.Length > 30 ? hoveredNode.Text[..30] + "..." : hoveredNode.Text)}\"" : "",
+                    !string.IsNullOrEmpty(hoveredNode.Text) ? $"\"{TextDisplay.Truncate(hoveredNode.Text, 30, string.Empty)}\"" : "",
                 };
 
                 float maxW = 0;

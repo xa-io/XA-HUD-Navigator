@@ -35,12 +35,19 @@ public sealed class ResolvedNativeFieldInfo
     public string Notes { get; set; } = "";
 }
 
-public static class ClientStructRuntimeInspector
+public static partial class ClientStructRuntimeInspector
 {
+    private const uint MemCommit = 0x1000;
+    private const uint PageNoAccess = 0x01;
+    private const uint PageGuard = 0x100;
+    internal const long MaxVectorElements = 1_000_000;
+
     private static readonly StringComparer NameComparer = StringComparer.OrdinalIgnoreCase;
-    private static readonly Lazy<Assembly> ClientStructsAssembly = new(() => typeof(AtkResNode).Assembly);
-    private static readonly Lazy<Dictionary<string, Type>> AddonStructTypes = new(BuildAddonStructTypes);
-    private static readonly Lazy<Dictionary<AgentId, Type>> AgentStructTypes = new(BuildAgentStructTypes);
+    private static readonly Lazy<ClientStructTypeMaps> StructTypeMaps = new(BuildStructTypeMaps);
+    private static readonly AgentId[] AgentIds = Enum.GetValues<AgentId>().Distinct().ToArray();
+
+    public static void Warmup()
+        => _ = StructTypeMaps.Value;
 
     public static ResolvedNativeStructSnapshot ResolveAddonStruct(string addonName, nint addonAddress)
     {
@@ -51,9 +58,12 @@ public static class ClientStructRuntimeInspector
             return snapshot;
         }
 
-        if (!AddonStructTypes.Value.TryGetValue(addonName, out var structType))
+        if (!StructTypeMaps.Value.Addons.TryGetValue(addonName, out var structType))
         {
             snapshot.ResolutionInfo = $"No generated AddonAttribute match for '{addonName}'.";
+            DiagnosticLog.WarningOnce(
+                "ClientStructRuntimeInspector.AddonAttributeMiss",
+                $"FFXIVClientStructs addon recognition degraded; no generated AddonAttribute matched '{addonName}'. Patch-day review may be required.");
             return snapshot;
         }
 
@@ -87,9 +97,12 @@ public static class ClientStructRuntimeInspector
         }
 
         snapshot.LookupKey = agentId.Value.ToString();
-        if (!AgentStructTypes.Value.TryGetValue(agentId.Value, out var structType))
+        if (!StructTypeMaps.Value.Agents.TryGetValue(agentId.Value, out var structType))
         {
             snapshot.ResolutionInfo = $"Resolved AgentId.{agentId.Value}, but FFXIVClientStructs has no generated AgentAttribute struct for it.";
+            DiagnosticLog.WarningOnce(
+                "ClientStructRuntimeInspector.AgentAttributeMiss",
+                $"FFXIVClientStructs agent recognition degraded; AgentId.{agentId.Value} has no generated AgentAttribute struct. Patch-day review may be required.");
             return snapshot;
         }
 
@@ -163,49 +176,51 @@ public static class ClientStructRuntimeInspector
         snapshot.FullTypeName = structType.FullName ?? structType.Name;
         snapshot.Size = TryGetStructSize(structType);
         snapshot.ResolutionInfo = resolutionInfo;
+        if (snapshot.Size <= 0)
+        {
+            snapshot.ResolutionInfo += " Reported struct size is unavailable; field reads were refused.";
+            return;
+        }
+
         snapshot.Fields = ReadFields(structType, snapshot.Address, snapshot.Size);
     }
 
-    private static Dictionary<string, Type> BuildAddonStructTypes()
+    private static ClientStructTypeMaps BuildStructTypeMaps()
     {
-        var results = new Dictionary<string, Type>(NameComparer);
+        var addons = new Dictionary<string, Type>(NameComparer);
+        var agents = new Dictionary<AgentId, Type>();
         foreach (var type in GetClientStructTypes())
         {
-            var attribute = type.GetCustomAttribute<AddonAttribute>();
-            if (attribute == null)
-                continue;
-
-            foreach (var identifier in attribute.AddonIdentifiers)
+            var addonAttribute = type.GetCustomAttribute<AddonAttribute>();
+            if (addonAttribute != null)
             {
-                if (!string.IsNullOrWhiteSpace(identifier))
-                    results[identifier] = type;
+                foreach (var identifier in addonAttribute.AddonIdentifiers)
+                {
+                    if (!string.IsNullOrWhiteSpace(identifier))
+                        addons[identifier] = type;
+                }
             }
+
+            var agentAttribute = type.GetCustomAttribute<AgentAttribute>();
+            if (agentAttribute != null)
+                agents[agentAttribute.Id] = type;
         }
 
-        return results;
-    }
-
-    private static Dictionary<AgentId, Type> BuildAgentStructTypes()
-    {
-        var results = new Dictionary<AgentId, Type>();
-        foreach (var type in GetClientStructTypes())
-        {
-            var attribute = type.GetCustomAttribute<AgentAttribute>();
-            if (attribute != null)
-                results[attribute.Id] = type;
-        }
-
-        return results;
+        return new ClientStructTypeMaps(addons, agents);
     }
 
     private static IEnumerable<Type> GetClientStructTypes()
     {
         try
         {
-            return ClientStructsAssembly.Value.GetTypes();
+            return typeof(AtkResNode).Assembly.GetTypes();
         }
         catch (ReflectionTypeLoadException ex)
         {
+            DiagnosticLog.WarningOnce(
+                "ClientStructRuntimeInspector.ReflectionTypeLoad",
+                "FFXIVClientStructs type discovery loaded only a partial type set. String-keyed addon/agent recognition may be incomplete.",
+                ex);
             return ex.Types.Where(type => type != null)!;
         }
     }
@@ -218,7 +233,7 @@ public static class ClientStructRuntimeInspector
             if (agentModule == null)
                 return null;
 
-            foreach (var agentId in Enum.GetValues<AgentId>().Distinct())
+            foreach (var agentId in AgentIds)
             {
                 try
                 {
@@ -226,14 +241,16 @@ public static class ClientStructRuntimeInspector
                     if ((nint)agent == agentAddress)
                         return agentId;
                 }
-                catch
+                catch (Exception ex)
                 {
                     // Some agent ids are noisy in live memory. Keep scanning.
+                    DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.TryResolveAgentId.Entry", ex);
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.TryResolveAgentId", ex);
         }
 
         return null;
@@ -258,26 +275,41 @@ public static class ClientStructRuntimeInspector
         {
             var offset = entry.Offset!.Value;
             var field = entry.Field;
+            var hasAddress = TryAddAddress(baseAddress, offset, out var fieldAddress);
             var fieldInfo = new ResolvedNativeFieldInfo
             {
                 Offset = offset,
                 Name = field.Name,
                 TypeName = FormatTypeName(field.FieldType),
-                Address = baseAddress != 0 ? baseAddress + offset : 0,
+                Address = hasAddress ? fieldAddress : 0,
             };
 
             var notes = BuildFieldNotes(field, structSize, offset);
-            if (TryReadFieldValue(fieldInfo.Address, field.FieldType, out var value, out var readNotes))
+            var readSize = GetDirectReadSize(field.FieldType);
+            var withinStruct = offset >= 0
+                               && (structSize <= 0
+                                   || (readSize > 0 ? offset <= structSize - readSize : offset < structSize));
+            if (!hasAddress)
+            {
+                fieldInfo.Value = "<unreadable>";
+                fieldInfo.Notes = JoinNotes(notes, "field address overflow");
+            }
+            else if (!withinStruct)
+            {
+                fieldInfo.Value = "<unreadable>";
+                fieldInfo.Notes = JoinNotes(notes, "field range exceeds reported struct size");
+            }
+            else if (TryReadFieldValue(fieldInfo.Address, field.FieldType, out var value, out var readNotes))
             {
                 fieldInfo.IsReadable = true;
                 fieldInfo.Value = value;
+                fieldInfo.Notes = JoinNotes(notes, readNotes);
             }
             else
             {
                 fieldInfo.Value = value;
+                fieldInfo.Notes = JoinNotes(notes, readNotes);
             }
-
-            fieldInfo.Notes = JoinNotes(notes, readNotes);
             results.Add(fieldInfo);
         }
 
@@ -314,6 +346,20 @@ public static class ClientStructRuntimeInspector
         if (address == 0)
         {
             notes = "address is 0";
+            return false;
+        }
+
+        var readSize = GetDirectReadSize(fieldType);
+        if (readSize <= 0)
+        {
+            notes = "nested struct / metadata only";
+            value = $"<{FormatTypeName(fieldType)}>";
+            return false;
+        }
+
+        if (!IsReadableRange(address, (nuint)readSize))
+        {
+            notes = $"native range is not readable ({readSize} bytes)";
             return false;
         }
 
@@ -431,8 +477,9 @@ public static class ClientStructRuntimeInspector
         }
         catch (Exception ex)
         {
-            notes = $"read failed: {ex.Message}";
-            value = "<error>";
+            DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.TryReadFieldValue", ex);
+            notes = "native field read failed";
+            value = "<unreadable>";
             return false;
         }
     }
@@ -525,6 +572,12 @@ public static class ClientStructRuntimeInspector
 
         try
         {
+            if (!IsReadableRange(address, (nuint)IntPtr.Size))
+            {
+                notes = "CStringPointer storage is not readable";
+                return false;
+            }
+
             var pointerValue = Marshal.ReadIntPtr(address);
             if (pointerValue == 0)
             {
@@ -547,8 +600,9 @@ public static class ClientStructRuntimeInspector
         }
         catch (Exception ex)
         {
-            value = "<error>";
-            notes = $"CStringPointer read failed: {ex.Message}";
+            DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.TryReadCStringPointerValue", ex);
+            value = "<unreadable>";
+            notes = "CStringPointer read failed";
             return false;
         }
     }
@@ -563,18 +617,19 @@ public static class ClientStructRuntimeInspector
 
         try
         {
+            if (!IsReadableRange(address, (nuint)(IntPtr.Size * 3)))
+            {
+                notes = "StdVector header is not readable";
+                return false;
+            }
+
             var first = Marshal.ReadIntPtr(address);
             var last = Marshal.ReadIntPtr(address + IntPtr.Size);
             var end = Marshal.ReadIntPtr(address + (IntPtr.Size * 2));
             var elementSize = GetElementStride(elementType);
 
-            long count = 0;
-            long capacity = 0;
-            if (elementSize > 0 && first != 0 && last != 0 && end != 0)
-            {
-                count = Math.Max(0, (last.ToInt64() - first.ToInt64()) / elementSize);
-                capacity = Math.Max(0, (end.ToInt64() - first.ToInt64()) / elementSize);
-            }
+            if (!TryValidateVectorHeader(first, last, end, elementSize, out var count, out var capacity, out notes))
+                return false;
 
             var parts = new List<string>
             {
@@ -603,8 +658,9 @@ public static class ClientStructRuntimeInspector
         }
         catch (Exception ex)
         {
-            value = "<error>";
-            notes = $"StdVector read failed: {ex.Message}";
+            DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.TryReadStdVectorSummary", ex);
+            value = "<unreadable>";
+            notes = "StdVector read failed";
             return false;
         }
     }
@@ -618,10 +674,71 @@ public static class ClientStructRuntimeInspector
         {
             return Marshal.SizeOf(elementType);
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.GetElementStride", ex);
             return 0;
         }
+    }
+
+    internal static bool TryValidateVectorHeader(
+        nint first,
+        nint last,
+        nint end,
+        int elementSize,
+        out long count,
+        out long capacity,
+        out string notes)
+    {
+        count = 0;
+        capacity = 0;
+        notes = string.Empty;
+
+        if (first == 0 && last == 0 && end == 0)
+            return true;
+
+        if (elementSize <= 0)
+        {
+            notes = "StdVector element size is invalid";
+            return false;
+        }
+
+        if (first == 0 || last == 0 || end == 0)
+        {
+            notes = "StdVector header mixes null and non-null pointers";
+            return false;
+        }
+
+        var firstValue = (nuint)first;
+        var lastValue = (nuint)last;
+        var endValue = (nuint)end;
+        if (firstValue > lastValue || lastValue > endValue)
+        {
+            notes = "invalid StdVector pointer ordering";
+            return false;
+        }
+
+        var stride = (nuint)elementSize;
+        var usedBytes = lastValue - firstValue;
+        var capacityBytes = endValue - firstValue;
+        if (usedBytes % stride != 0 || capacityBytes % stride != 0)
+        {
+            notes = "StdVector byte span is not aligned to its element size";
+            return false;
+        }
+
+        var countValue = usedBytes / stride;
+        var capacityValue = capacityBytes / stride;
+        if (capacityValue > (nuint)MaxVectorElements
+            || capacityValue < countValue)
+        {
+            notes = $"StdVector count/capacity is implausible ({countValue}/{capacityValue})";
+            return false;
+        }
+
+        count = (long)countValue;
+        capacity = (long)capacityValue;
+        return true;
     }
 
     private static List<string> ReadCStringPointerVectorPreview(nint first, long count, int elementSize, int maxItems)
@@ -635,7 +752,13 @@ public static class ClientStructRuntimeInspector
         {
             try
             {
-                var elementAddress = first + (i * elementSize);
+                if (!TryAddAddress(first, i * elementSize, out var elementAddress)
+                    || !IsReadableRange(elementAddress, (nuint)IntPtr.Size))
+                {
+                    preview.Add($"{i}:<unreadable>");
+                    continue;
+                }
+
                 var stringPointer = Marshal.ReadIntPtr(elementAddress);
                 if (stringPointer == 0)
                 {
@@ -653,8 +776,9 @@ public static class ClientStructRuntimeInspector
                     preview.Add($"{i}:0x{stringPointer.ToInt64():X}");
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.ReadCStringPointerVectorPreview", ex);
                 preview.Add($"{i}:<error>");
             }
         }
@@ -662,12 +786,15 @@ public static class ClientStructRuntimeInspector
         return preview;
     }
 
-    private static bool TryReadUtf8CString(nint pointerValue, int maxBytes, out string value, out bool truncated)
+    internal static bool TryReadUtf8CString(nint pointerValue, int maxBytes, out string value, out bool truncated)
     {
         value = string.Empty;
         truncated = false;
 
         if (pointerValue == 0 || maxBytes <= 0)
+            return false;
+
+        if (!IsReadableRange(pointerValue, (nuint)maxBytes))
             return false;
 
         try
@@ -687,8 +814,9 @@ public static class ClientStructRuntimeInspector
             value = Encoding.UTF8.GetString(buffer, 0, length);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.TryReadUtf8CString", ex);
             value = string.Empty;
             truncated = false;
             return false;
@@ -704,7 +832,114 @@ public static class ClientStructRuntimeInspector
         if (normalized.Length <= maxLength)
             return normalized;
 
-        return normalized[..maxLength];
+        return TextDisplay.Truncate(normalized, maxLength, string.Empty, string.Empty);
+    }
+
+    internal static int GetDirectReadSize(Type fieldType)
+    {
+        if (fieldType.IsEnum)
+            return GetDirectReadSize(fieldType.GetEnumUnderlyingType());
+
+        if (fieldType.IsPointer
+            || fieldType == typeof(IntPtr)
+            || fieldType == typeof(UIntPtr)
+            || IsClientStructPointer(fieldType)
+            || IsCStringPointerType(fieldType))
+            return IntPtr.Size;
+
+        if (IsStdVectorType(fieldType, out _))
+            return IntPtr.Size * 3;
+
+        if (fieldType == typeof(bool) || fieldType == typeof(byte) || fieldType == typeof(sbyte))
+            return 1;
+        if (fieldType == typeof(short) || fieldType == typeof(ushort) || fieldType == typeof(char))
+            return 2;
+        if (fieldType == typeof(int) || fieldType == typeof(uint) || fieldType == typeof(float))
+            return 4;
+        if (fieldType == typeof(long) || fieldType == typeof(ulong) || fieldType == typeof(double))
+            return 8;
+
+        return 0;
+    }
+
+    internal static bool TryAddAddress(nint baseAddress, int offset, out nint address)
+    {
+        address = 0;
+        if (baseAddress == 0 || offset < 0)
+            return false;
+
+        try
+        {
+            var sum = checked(baseAddress.ToInt64() + offset);
+            if (IntPtr.Size == 4 && (sum < int.MinValue || sum > int.MaxValue))
+                return false;
+
+            address = (nint)sum;
+            return address != 0;
+        }
+        catch (OverflowException)
+        {
+            return false;
+        }
+    }
+
+    internal static bool IsReadableRange(nint address, nuint length)
+    {
+        if (address == 0 || length == 0)
+            return false;
+
+        var start = (nuint)address;
+        if (nuint.MaxValue - start < length)
+            return false;
+
+        var requestedEnd = start + length;
+        var current = start;
+        while (current < requestedEnd)
+        {
+            if (!TryQueryMemory((nint)current, out var info))
+                return false;
+
+            var regionStart = (nuint)info.BaseAddress;
+            if (info.RegionSize == 0 || nuint.MaxValue - regionStart < info.RegionSize)
+                return false;
+
+            var regionEnd = regionStart + info.RegionSize;
+            if (current < regionStart || current >= regionEnd || !IsReadableProtection(info.State, info.Protect))
+                return false;
+
+            var next = regionEnd < requestedEnd ? regionEnd : requestedEnd;
+            if (next <= current)
+                return false;
+
+            current = next;
+        }
+
+        return true;
+    }
+
+    private static bool TryQueryMemory(nint address, out MemoryBasicInformation info)
+    {
+        try
+        {
+            return VirtualQuery(
+                address,
+                out info,
+                (nuint)Marshal.SizeOf<MemoryBasicInformation>()) != 0;
+        }
+        catch (Exception ex)
+        {
+            info = default;
+            DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.VirtualQuery", ex);
+            return false;
+        }
+    }
+
+    internal static bool IsReadableProtection(uint state, uint protect)
+    {
+        if (state != MemCommit || (protect & (PageNoAccess | PageGuard)) != 0)
+            return false;
+
+        return (protect & 0xFF) is 0x02 or 0x04 or 0x08 or 0x20 or 0x40 or 0x80;
     }
 
     private static int TryGetStructSize(Type structType)
@@ -713,13 +948,14 @@ public static class ClientStructRuntimeInspector
         {
             return Marshal.SizeOf(structType);
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.TryGetStructSize", ex);
             return 0;
         }
     }
 
-    private static string FormatTypeName(Type type)
+    internal static string FormatTypeName(Type type)
     {
         if (type.IsPointer)
             return $"{FormatTypeName(type.GetElementType()!)}*";
@@ -740,4 +976,23 @@ public static class ClientStructRuntimeInspector
 
         return type.Name;
     }
+
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    private static partial nuint VirtualQuery(nint address, out MemoryBasicInformation buffer, nuint length);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MemoryBasicInformation
+    {
+        public nint BaseAddress;
+        public nint AllocationBase;
+        public uint AllocationProtect;
+        public nuint RegionSize;
+        public uint State;
+        public uint Protect;
+        public uint Type;
+    }
+
+    private sealed record ClientStructTypeMaps(
+        Dictionary<string, Type> Addons,
+        Dictionary<AgentId, Type> Agents);
 }

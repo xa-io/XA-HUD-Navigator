@@ -1,9 +1,11 @@
 using System;
+using System.Threading.Tasks;
 using Dalamud.Game.Command;
 using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
+using XAHudNavigator.Services;
 using XAHudNavigator.Windows;
 
 namespace XAHudNavigator;
@@ -22,20 +24,21 @@ public sealed class Plugin : IDalamudPlugin
     private const string CommandName = "/xahud";
 
     public Configuration Configuration { get; init; }
+    public AddonSnapshotService AddonSnapshots { get; }
 
-    public readonly WindowSystem WindowSystem = new("XAHudNavigator");
+    public WindowSystem WindowSystem { get; } = new("XAHudNavigator");
     private MainWindow MainWindow { get; init; }
     private HudOverlay HudOverlay { get; init; }
     private bool disposed;
 
-    public MainWindow GetMainWindow() => MainWindow;
-
     public Plugin()
     {
-        Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+        Configuration = LoadConfiguration();
+        AddonSnapshots = new AddonSnapshotService(Configuration);
 
         MainWindow = new MainWindow(this);
         HudOverlay = new HudOverlay(this);
+        _ = Task.Run(ClientStructRuntimeInspector.Warmup);
 
         WindowSystem.AddWindow(MainWindow);
         WindowSystem.AddWindow(HudOverlay);
@@ -68,6 +71,17 @@ public sealed class Plugin : IDalamudPlugin
         TryCleanup("WindowSystem.RemoveAllWindows", WindowSystem.RemoveAllWindows);
         TryCleanup("MainWindow.Dispose", MainWindow.Dispose);
         TryCleanup("HudOverlay.Dispose", HudOverlay.Dispose);
+        TryCleanup("AddonSnapshots.Dispose", AddonSnapshots.Dispose);
+    }
+
+    private static Configuration LoadConfiguration()
+    {
+        return Configuration.LoadOrDefault(
+            PluginInterface.GetPluginConfig,
+            PluginInterface.SavePluginConfig,
+            ex => Log.Warning(
+                ex,
+                "[XAHudNavigator] Configuration load, migration, or persistence failed; continuing with safe in-memory settings."));
     }
 
     private static void TryCleanup(string label, Action cleanup)
@@ -109,5 +123,5 @@ public sealed class Plugin : IDalamudPlugin
 
 internal static class BuildInfo
 {
-    public const string Version = "0.0.0.8";
+    public const string Version = "0.0.0.9";
 }

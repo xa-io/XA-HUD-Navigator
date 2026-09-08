@@ -6,19 +6,20 @@ XA HUD Navigator is a Dalamud plugin for FFXIV that provides a real-time visual 
 
 ## Key Features
 
-- **Addon List** — Shows all loaded game addons with node counts, visibility, and ready state
-- **Node Tree Inspector** — Sortable table of every node in a selected addon: type, position, size, text content, event info
+- **Addon List** — Shows one Framework-published snapshot of all loaded game addons with node counts, visibility, and ready state
+- **Node Tree Inspector** — Sortable table that preserves each selected addon's native node indices and null gaps while showing type, scaled bounds, text, and event details
 - **Logging Workspace** — Optional logging mode to capture addon appear/close timing plus live `AtkValues` arrays while you interact with in-game UI
 - **Debug Workspace** — Optional debug tab with recursive component-path dumps, unified filtering across node paths, addon lookup instances, `AtkValues`, and runtime struct fields, selected-branch copy helpers, raw node flags/pointers, a generic `AtkUnitBase` snapshot, and resolved addon/agent ClientStruct field tables for the currently selected addon
 - **Lumina Sheets Browser** — Optional sheets workspace with common-sheet shortcuts, all-sheet search, schema-aware column headers, a multi-row grid, row jumping, and copy helpers
 - **CS.Sheets Browser** — ClientStructs-backed runtime workspace with curated game, player, world, instance, zone-init packet, map, quest, inventory, retainer, housing, social, blacklist, market, Free Company, FATE, party, action, target, Eureka, and Bozja views rendered in the same sheet-style grid workflow, plus loaded-row value filtering, replay-cached zone-init correlation, hook-unavailable reporting, map/public-content range inspection, and a 3-character minimum master search for quick runtime research
 - **Interactive Element Detection** — Identifies buttons, checkboxes, sliders, dropdowns, and other interactive component nodes
-- **HUD Overlay** — Transparent fullscreen overlay draws colored outlines around visible addons and highlights interactive nodes in green
+- **HUD Overlay** — Transparent fullscreen overlay uses native origins and scaled extents, filters hidden or disappearing nodes, resolves overlap in reverse draw order, and remains aligned from 100% through 200% UI scale
 - **Text Node Display** — Shows text content from AtkTextNode elements for reading addon text
 - **Copy to Clipboard** — Copy addon names or full node dumps for use in automation development
-- **Search & Filter** — Filter addon list by name, toggle visible-only mode
-- **Configurable Overlay** — Toggle bounding boxes, node IDs, addon names, interactive-only mode, alpha, refresh rate
+- **Search & Filter** — Filter the shared addon snapshot by name
+- **Configurable Overlay** — Toggle bounding boxes, node IDs, addon names, and interactive-only mode; the native scan cadence is clamped to safe refresh bounds
 - **Dalamud Interface Scale Support** — Fixed-width inspector panes, sheet grids, and overlay labels follow the current Dalamud interface zoom so the workspace stays usable above or below 100% scale
+- **Fail-Closed Native Inspection** — ClientStruct field reads validate struct ranges, memory pages, pointer arithmetic, CStrings, vectors, and generated type maps while throttling repeated diagnostics
 
 Selected-node runtime research now includes copyable event-manager details, first-level component child-node summaries, and `TreeList` runtime/renderer sections in the right-side `Node Detail` pane. This is intended for Eureka-style addon work where the important interaction state lives inside a component root rather than a simple text node or top-level callback.
 

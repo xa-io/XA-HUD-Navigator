@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Numerics;
 using System.Text;
 using FFXIVClientStructs.FFXIV.Component.GUI;
@@ -137,6 +138,9 @@ public class AddonLookupInstanceInfo
 /// </summary>
 public static class AddonInspector
 {
+    private const int MaxNativeNodeSlots = 16384;
+    private const int MaxNativeAtkValueSlots = 16384;
+    private const int MaxDebugEntries = 16384;
     private static readonly Dictionary<ushort, string> ComponentTypeNames = new()
     {
         { 1000, "Custom" }, { 1001, "Button" }, { 1002, "Window" },
@@ -154,6 +158,44 @@ public static class AddonInspector
         1001, 1003, 1004, 1005, 1006, 1007, 1009, 1010, 1011, 1016, 1023,
     };
 
+    internal static bool IsPlausibleNativeCount(int count, int maximum)
+    {
+        return maximum >= 0 && count >= 0 && count <= maximum;
+    }
+
+    internal static int ClampInlineNativeCount(int count, int capacity)
+    {
+        return count <= 0 || capacity <= 0 ? 0 : Math.Min(count, capacity);
+    }
+
+    internal static unsafe bool TrySnapshotPointerArray(
+        nint pointerArrayAddress,
+        int count,
+        int maximum,
+        out nint[] pointers)
+    {
+        pointers = Array.Empty<nint>();
+        if (!IsPlausibleNativeCount(count, maximum))
+            return false;
+        if (count == 0)
+            return true;
+        if (pointerArrayAddress == 0
+            || (nuint)count > nuint.MaxValue / (nuint)IntPtr.Size)
+            return false;
+
+        var byteLength = (nuint)count * (nuint)IntPtr.Size;
+        if (!ClientStructRuntimeInspector.IsReadableRange(pointerArrayAddress, byteLength))
+            return false;
+
+        var source = (nint*)pointerArrayAddress;
+        var snapshot = new nint[count];
+        for (var i = 0; i < count; i++)
+            snapshot[i] = source[i];
+
+        pointers = snapshot;
+        return true;
+    }
+
     /// <summary>
     /// Scans all loaded addons in the AtkUnitManager and returns inspection data.
     /// Always returns ALL addons (visible and hidden) for the full list.
@@ -170,26 +212,52 @@ public static class AddonInspector
             var unitManager = stage->RaptureAtkUnitManager;
             if (unitManager == null) return results;
 
-            // Get the focused addon for highlighting
+            // Slot zero retains stale data when Count is zero, so never read it unconditionally.
             AtkUnitBase* focusedAddon = null;
             try
             {
-                focusedAddon = unitManager->AtkUnitManager.FocusedUnitsList.Entries[0].Value;
+                var focusedList = &unitManager->AtkUnitManager.FocusedUnitsList;
+                var focusedRawCount = (int)focusedList->Count;
+                var focusedCount = ClampInlineNativeCount(focusedRawCount, focusedList->Entries.Length);
+                if (focusedRawCount > focusedCount)
+                {
+                    DiagnosticLog.WarningOnce(
+                        "ScanAllAddons.FocusedCount",
+                        $"Clamped focused-addon count ({focusedRawCount}) to inline capacity ({focusedList->Entries.Length}).");
+                }
+
+                if (focusedCount > 0)
+                    focusedAddon = focusedList->Entries[0].Value;
             }
-            catch
+            catch (Exception ex)
             {
+                DiagnosticLog.VerboseThrottled("ScanAllAddons.FocusedUnitsList", ex);
                 focusedAddon = null;
             }
 
             var allLoadedList = &unitManager->AtkUnitManager.AllLoadedUnitsList;
-            if (allLoadedList == null) return results;
+            var loadedRawCount = (int)allLoadedList->Count;
+            var loadedCount = ClampInlineNativeCount(loadedRawCount, allLoadedList->Entries.Length);
+            if (loadedRawCount > loadedCount)
+            {
+                DiagnosticLog.WarningOnce(
+                    "ScanAllAddons.InvalidCount",
+                    $"Clamped loaded-addon count ({loadedRawCount}) to inline capacity ({allLoadedList->Entries.Length}).");
+            }
 
-            for (var i = 0; i < allLoadedList->Count; i++)
+            for (var i = 0; i < loadedCount; i++)
             {
                 AtkUnitBase* addon;
                 try { addon = allLoadedList->Entries[i].Value; }
-                catch { continue; }
+                catch (Exception ex) { DiagnosticLog.VerboseThrottled("ScanAllAddons.AllLoadedUnitsList", ex); continue; }
                 if (addon == null) continue;
+                if (!ClientStructRuntimeInspector.IsReadableRange((nint)addon, (nuint)sizeof(AtkUnitBase)))
+                {
+                    DiagnosticLog.WarningOnce(
+                        "ScanAllAddons.UnreadableAddon",
+                        "Skipped an unreadable loaded-addon pointer.");
+                    continue;
+                }
 
                 string name;
                 try
@@ -200,7 +268,7 @@ public static class AddonInspector
                         ? Encoding.UTF8.GetString(nameSpan.Slice(0, nullIdx))
                         : $"<unnamed_{i}>";
                 }
-                catch { name = $"<error_{i}>"; }
+                catch (Exception ex) { DiagnosticLog.VerboseThrottled("ScanAllAddons.Name", ex); name = $"<error_{i}>"; }
 
                 var info = new AddonInfo
                 {
@@ -208,22 +276,17 @@ public static class AddonInspector
                     IsVisible = addon->IsVisible,
                     IsReady = addon->IsReady,
                     Position = new Vector2(addon->X, addon->Y),
-                    Size = new Vector2(addon->RootNode != null ? addon->RootNode->Width : 0,
-                                       addon->RootNode != null ? addon->RootNode->Height : 0),
+                    Size = ComputeSafeAddonSize(addon),
                     Scale = addon->Scale,
                     NodeCount = addon->UldManager.NodeListCount,
                     Address = (nint)addon,
                     IsFocused = focusedAddon != null && addon == focusedAddon,
                 };
 
-                // Only scan nodes for visible addons (performance)
-                if (addon->IsVisible)
-                    info.Nodes = ScanNodes(addon);
-
                 results.Add(info);
             }
         }
-        catch { }
+        catch (Exception ex) { DiagnosticLog.VerboseThrottled("ScanAllAddons", ex); }
 
         return results;
     }
@@ -236,7 +299,9 @@ public static class AddonInspector
         try
         {
             var addon = TryGetAddonByName(name);
-            if (addon == null) return null;
+            if (addon == null
+                || !ClientStructRuntimeInspector.IsReadableRange((nint)addon, (nuint)sizeof(AtkUnitBase)))
+                return null;
 
             var info = new AddonInfo
             {
@@ -244,8 +309,7 @@ public static class AddonInspector
                 IsVisible = addon->IsVisible,
                 IsReady = addon->IsReady,
                 Position = new Vector2(addon->X, addon->Y),
-                Size = new Vector2(addon->RootNode != null ? addon->RootNode->Width : 0,
-                                   addon->RootNode != null ? addon->RootNode->Height : 0),
+                Size = ComputeSafeAddonSize(addon),
                 Scale = addon->Scale,
                 NodeCount = addon->UldManager.NodeListCount,
                 Address = (nint)addon,
@@ -253,46 +317,7 @@ public static class AddonInspector
             info.Nodes = ScanNodes(addon);
             return info;
         }
-        catch { return null; }
-    }
-
-    /// <summary>
-    /// Finds which addon and node is at the given screen position.
-    /// Used for mouse-hover inspection.
-    /// </summary>
-    public static unsafe (string? AddonName, int NodeIndex) HitTest(Vector2 screenPos, List<AddonInfo> addons)
-    {
-        // Iterate in reverse (top-most addon first)
-        for (int a = addons.Count - 1; a >= 0; a--)
-        {
-            var addon = addons[a];
-            if (!addon.IsVisible) continue;
-            if (addon.Size.X <= 0 || addon.Size.Y <= 0) continue;
-
-            var addonMin = addon.Position;
-            var addonMax = addon.Position + addon.Size;
-
-            if (screenPos.X >= addonMin.X && screenPos.X <= addonMax.X &&
-                screenPos.Y >= addonMin.Y && screenPos.Y <= addonMax.Y)
-            {
-                // Check nodes in reverse (top-most node first)
-                for (int n = 0; n < addon.Nodes.Count; n++)
-                {
-                    var node = addon.Nodes[n];
-                    if (!node.IsVisible || node.Size.X <= 0 || node.Size.Y <= 0) continue;
-
-                    var nMin = node.ScreenPosition;
-                    var nMax = nMin + node.Size;
-                    if (screenPos.X >= nMin.X && screenPos.X <= nMax.X &&
-                        screenPos.Y >= nMin.Y && screenPos.Y <= nMax.Y)
-                    {
-                        return (addon.Name, n);
-                    }
-                }
-                return (addon.Name, -1);
-            }
-        }
-        return (null, -1);
+        catch (Exception ex) { DiagnosticLog.VerboseThrottled("ScanSingleAddon", ex); return null; }
     }
 
     public static unsafe AddonDebugSnapshot? ScanDebugAddon(string name)
@@ -300,7 +325,9 @@ public static class AddonInspector
         try
         {
             var addon = TryGetAddonByName(name);
-            if (addon == null) return null;
+            if (addon == null
+                || !ClientStructRuntimeInspector.IsReadableRange((nint)addon, (nuint)sizeof(AtkUnitBase)))
+                return null;
 
             var snapshot = new AddonDebugSnapshot
             {
@@ -308,8 +335,7 @@ public static class AddonInspector
                 IsVisible = addon->IsVisible,
                 IsReady = addon->IsReady,
                 Position = new Vector2(addon->X, addon->Y),
-                Size = new Vector2(addon->RootNode != null ? addon->RootNode->Width : 0,
-                                   addon->RootNode != null ? addon->RootNode->Height : 0),
+                Size = ComputeSafeAddonSize(addon),
                 Scale = addon->Scale,
                 NodeCount = addon->UldManager.NodeListCount,
                 Address = (nint)addon,
@@ -326,17 +352,35 @@ public static class AddonInspector
             snapshot.AddonStruct = ClientStructRuntimeInspector.ResolveAddonStruct(name, snapshot.Address);
             snapshot.AgentStruct = ClientStructRuntimeInspector.ResolveAgentStruct(snapshot.AgentAddress);
 
-            for (var i = 0; i < addon->UldManager.NodeListCount; i++)
+            var nodeCount = (int)addon->UldManager.NodeListCount;
+            if (!TrySnapshotPointerArray(
+                    (nint)addon->UldManager.NodeList,
+                    nodeCount,
+                    MaxNativeNodeSlots,
+                    out var nodeSlots))
             {
-                var node = addon->UldManager.NodeList[i];
-                if (node != null)
-                    CollectDebugEntries(node, $"[{i}]", snapshot.Entries);
+                DiagnosticLog.WarningOnce(
+                    "ScanDebugAddon.InvalidNodeList",
+                    $"Skipped an invalid or unreadable debug-node list ({nodeCount} slots).");
+            }
+            else
+            {
+                for (var i = 0; i < nodeSlots.Length; i++)
+                {
+                    var node = (AtkResNode*)nodeSlots[i];
+                    if (node != null
+                        && ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
+                    {
+                        CollectDebugEntries(node, $"[{i}]", snapshot.Entries);
+                    }
+                }
             }
 
             return snapshot;
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("ScanDebugAddon", ex);
             return null;
         }
     }
@@ -381,8 +425,9 @@ public static class AddonInspector
             var addon = TryGetAddonByName(addonName);
             return addon == null ? new List<AddonAtkValueInfo>() : ScanAtkValues(addon);
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("ScanAddonAtkValues", ex);
             return new List<AddonAtkValueInfo>();
         }
     }
@@ -393,19 +438,48 @@ public static class AddonInspector
             ? $"GameGui[{entry.Index}]"
             : entry.Source;
         var selectedSuffix = entry.MatchesSelectedSnapshot ? " | SELECTED" : string.Empty;
-        return $"{label} | Visible={entry.IsVisible} Ready={entry.IsReady} Nodes={entry.NodeCount} " +
-               $"Pos=({entry.Position.X:F1}, {entry.Position.Y:F1}) Size={entry.Size.X:F1}x{entry.Size.Y:F1} Scale={entry.Scale:F2} " +
-               $"Addr=0x{entry.Address:X}{selectedSuffix}";
+        return FormattableString.Invariant(
+            $"{label} | Visible={entry.IsVisible} Ready={entry.IsReady} Nodes={entry.NodeCount} Pos=({entry.Position.X:F1}, {entry.Position.Y:F1}) Size={entry.Size.X:F1}x{entry.Size.Y:F1} Scale={entry.Scale:F2} Addr=0x{entry.Address:X}{selectedSuffix}");
     }
 
-    public static unsafe NodeRuntimeReport? BuildNodeRuntimeReport(string addonName, int nodeIndex)
+    public static NodeRuntimeReport? BuildNodeRuntimeReport(string addonName, int nodeIndex)
+    {
+        try
+        {
+            return BuildNodeRuntimeReportCore(addonName, nodeIndex);
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.VerboseThrottled("BuildNodeRuntimeReport", ex);
+            return null;
+        }
+    }
+
+    private static unsafe NodeRuntimeReport? BuildNodeRuntimeReportCore(string addonName, int nodeIndex)
     {
         var addon = TryGetAddonByName(addonName);
-        if (addon == null || !addon->IsVisible || nodeIndex < 0 || nodeIndex >= addon->UldManager.NodeListCount)
+        if (addon == null
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)addon, (nuint)sizeof(AtkUnitBase))
+            || !addon->IsVisible
+            || addon->UldManager.NodeList == null
+            || nodeIndex < 0)
             return null;
 
-        var node = addon->UldManager.NodeList[nodeIndex];
-        if (node == null)
+        var nodeCount = (int)addon->UldManager.NodeListCount;
+        if (!IsPlausibleNativeCount(nodeCount, MaxNativeNodeSlots)
+            || nodeIndex >= nodeCount)
+            return null;
+
+        if (!TrySnapshotPointerArray(
+                (nint)addon->UldManager.NodeList,
+                nodeCount,
+                MaxNativeNodeSlots,
+                out var nodeSlots))
+            return null;
+
+        var node = (AtkResNode*)nodeSlots[nodeIndex];
+        if (node == null
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
             return null;
 
         var report = new NodeRuntimeReport
@@ -428,6 +502,12 @@ public static class AddonInspector
         }
 
         var component = componentNode->Component;
+        if (!ClientStructRuntimeInspector.IsReadableRange((nint)component, (nuint)sizeof(AtkComponentBase)))
+        {
+            report.SummaryLines.Add("Component Address: <unreadable>");
+            return report;
+        }
+
         report.SummaryLines.Add($"Component Address: 0x{(nint)component:X}");
         report.SummaryLines.Add($"Component Type: {GetNodeTypeDisplay(node->Type, typeVal)}");
         report.SummaryLines.Add($"Owner Node: {FormatPointer((nint)component->OwnerNode)}");
@@ -438,8 +518,9 @@ public static class AddonInspector
         {
             focusNode = component->GetFocusNode();
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("BuildNodeRuntimeReport.GetFocusNode", ex);
         }
 
         report.SummaryLines.Add($"Focus Node: {FormatPointer((nint)focusNode)}");
@@ -471,7 +552,11 @@ public static class AddonInspector
 
     private static unsafe void CollectDebugEntries(AtkResNode* node, string path, List<AddonDebugEntry> results, int depth = 0)
     {
-        if (node == null || depth > 5) return;
+        if (node == null
+            || depth > 5
+            || results.Count >= MaxDebugEntries
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
+            return;
 
         var typeVal = (ushort)node->Type;
         var displayPath = node->Type == NodeType.Counter ? $"{path}[ctr]" : path;
@@ -481,7 +566,7 @@ public static class AddonInspector
             NodeId = node->NodeId,
             TypeName = GetNodeTypeDisplay(node->Type, typeVal),
             TypeRaw = typeVal,
-            IsVisible = node->IsVisible(),
+            IsVisible = node->NodeFlags.HasFlag(NodeFlags.Visible),
             IsInteractive = InteractiveComponentTypes.Contains(typeVal),
             NodeFlagsRaw = (ushort)node->NodeFlags,
             NodeFlagsText = node->NodeFlags.ToString(),
@@ -506,7 +591,7 @@ public static class AddonInspector
                 entry.IsInteractive = true;
             }
         }
-        catch { }
+        catch (Exception ex) { DiagnosticLog.VerboseThrottled("CollectDebugEntries.Event", ex); }
 
         try
         {
@@ -522,20 +607,35 @@ public static class AddonInspector
                 entry.Text = counterNode->NodeText.ToString() ?? "";
             }
         }
-        catch { }
+        catch (Exception ex) { DiagnosticLog.VerboseThrottled("CollectDebugEntries.Text", ex); }
 
         results.Add(entry);
 
         if (typeVal >= 1000)
         {
             var compNode = (AtkComponentNode*)node;
-            if (compNode->Component != null)
+            if (compNode->Component != null
+                && ClientStructRuntimeInspector.IsReadableRange(
+                    (nint)compNode->Component,
+                    (nuint)sizeof(AtkComponentBase)))
             {
                 entry.ComponentAddress = (nint)compNode->Component;
-                var childCount = compNode->Component->UldManager.NodeListCount;
-                for (var i = 0; i < childCount; i++)
+                var childCount = (int)compNode->Component->UldManager.NodeListCount;
+                if (!TrySnapshotPointerArray(
+                        (nint)compNode->Component->UldManager.NodeList,
+                        childCount,
+                        MaxNativeNodeSlots,
+                        out var childSlots))
                 {
-                    var child = compNode->Component->UldManager.NodeList[i];
+                    DiagnosticLog.WarningOnce(
+                        "CollectDebugEntries.InvalidChildList",
+                        $"Skipped an invalid or unreadable recursive component-node list ({childCount} slots).");
+                    return;
+                }
+
+                for (var i = 0; i < childSlots.Length; i++)
+                {
+                    var child = (AtkResNode*)childSlots[i];
                     if (child != null)
                         CollectDebugEntries(child, $"{path}→[{i}]", results, depth + 1);
                 }
@@ -545,18 +645,32 @@ public static class AddonInspector
 
     private static unsafe void AppendComponentChildLines(List<string> lines, AtkComponentBase* component)
     {
-        if (component == null)
+        if (component == null
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)component, (nuint)sizeof(AtkComponentBase)))
             return;
 
-        var childCount = component->UldManager.NodeListCount;
-        for (var i = 0; i < childCount; i++)
+        var childCount = (int)component->UldManager.NodeListCount;
+        if (!TrySnapshotPointerArray(
+                (nint)component->UldManager.NodeList,
+                childCount,
+                MaxNativeNodeSlots,
+                out var childSlots))
         {
-            var child = component->UldManager.NodeList[i];
-            if (child == null)
+            DiagnosticLog.WarningOnce(
+                "AppendComponentChildLines.InvalidList",
+                $"Skipped an invalid or unreadable component-node list ({childCount} slots).");
+            return;
+        }
+
+        for (var i = 0; i < childSlots.Length; i++)
+        {
+            var child = (AtkResNode*)childSlots[i];
+            if (child == null
+                || !ClientStructRuntimeInspector.IsReadableRange((nint)child, (nuint)sizeof(AtkResNode)))
                 continue;
 
             var childType = (ushort)child->Type;
-            var line = $"[{i}] #{child->NodeId} {GetNodeTypeDisplay(child->Type, childType)} | Visible={child->IsVisible()}";
+            var line = $"[{i}] #{child->NodeId} {GetNodeTypeDisplay(child->Type, childType)} | Visible={child->NodeFlags.HasFlag(NodeFlags.Visible)}";
 
             try
             {
@@ -564,8 +678,9 @@ public static class AddonInspector
                 if (evt != null)
                     line += $" | event:{evt->Param} @ 0x{(nint)evt:X}";
             }
-            catch
+            catch (Exception ex)
             {
+                DiagnosticLog.VerboseThrottled("AppendComponentChildLines.Event", ex);
             }
 
             var text = TryGetNodeText(child);
@@ -579,7 +694,10 @@ public static class AddonInspector
 
     private static unsafe void AppendTreeListLines(NodeRuntimeReport report, AtkComponentTreeList* treeList)
     {
-        if (treeList == null)
+        if (treeList == null
+            || !ClientStructRuntimeInspector.IsReadableRange(
+                (nint)treeList,
+                (nuint)sizeof(AtkComponentTreeList)))
             return;
 
         var itemCount = treeList->GetItemCount();
@@ -636,8 +754,9 @@ public static class AddonInspector
             {
                 renderer = treeList->GetItemRenderer(i);
             }
-            catch
+            catch (Exception ex)
             {
+                DiagnosticLog.VerboseThrottled("AppendTreeListLines.GetItemRenderer", ex);
                 continue;
             }
 
@@ -664,7 +783,8 @@ public static class AddonInspector
 
     private static unsafe void AppendEventLines(List<string> lines, string label, AtkResNode* node)
     {
-        if (node == null)
+        if (node == null
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
             return;
 
         try
@@ -679,15 +799,17 @@ public static class AddonInspector
             lines.Add($"{label} Event: 0x{(nint)evt:X}");
             lines.Add($"{label} Event Param: {evt->Param}");
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("AppendEventLines", ex);
             lines.Add($"{label} Event: <error>");
         }
     }
 
     private static unsafe string TryGetNodeText(AtkResNode* node)
     {
-        if (node == null)
+        if (node == null
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
             return string.Empty;
 
         try
@@ -704,8 +826,9 @@ public static class AddonInspector
                 return counterNode->NodeText.ToString() ?? string.Empty;
             }
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("TryGetNodeText", ex);
         }
 
         return string.Empty;
@@ -716,8 +839,10 @@ public static class AddonInspector
         if (string.IsNullOrWhiteSpace(text))
             return string.Empty;
 
-        var trimmed = text.Replace("\r", " ").Replace("\n", " ").Trim();
-        return trimmed.Length <= maxLength ? trimmed : trimmed[..maxLength] + "...";
+        var trimmed = string.Join(
+            ' ',
+            text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return TextDisplay.Truncate(trimmed, maxLength, string.Empty);
     }
 
     private static string FormatPointer(nint address)
@@ -748,8 +873,9 @@ public static class AddonInspector
             var agent = Plugin.GameGui.FindAgentInterface(addonName);
             return agent.IsNull ? 0 : agent.Address;
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("TryFindAgentAddress", ex);
             return 0;
         }
     }
@@ -793,10 +919,13 @@ public static class AddonInspector
                 if (addon == null)
                     continue;
 
-                results.Add(CreateAddonLookupInstanceInfo(addon, "GameGui", index));
+                var instance = CreateAddonLookupInstanceInfo(addon, "GameGui", index);
+                if (instance != null)
+                    results.Add(instance);
             }
-            catch
+            catch (Exception ex)
             {
+                DiagnosticLog.VerboseThrottled("ScanGameGuiAddonInstances", ex);
             }
         }
 
@@ -818,14 +947,19 @@ public static class AddonInspector
             var addon = unitManager->GetAddonByName(addonName);
             return addon == null ? null : CreateAddonLookupInstanceInfo(addon, "RaptureAtkUnitManager", 0);
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("ScanRaptureAddonInstance", ex);
             return null;
         }
     }
 
-    private static unsafe AddonLookupInstanceInfo CreateAddonLookupInstanceInfo(AtkUnitBase* addon, string source, int index)
+    private static unsafe AddonLookupInstanceInfo? CreateAddonLookupInstanceInfo(AtkUnitBase* addon, string source, int index)
     {
+        if (addon == null
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)addon, (nuint)sizeof(AtkUnitBase)))
+            return null;
+
         return new AddonLookupInstanceInfo
         {
             Source = source,
@@ -834,8 +968,7 @@ public static class AddonInspector
             IsVisible = addon->IsVisible,
             IsReady = addon->IsReady,
             Position = new Vector2(addon->X, addon->Y),
-            Size = new Vector2(addon->RootNode != null ? addon->RootNode->Width : 0,
-                               addon->RootNode != null ? addon->RootNode->Height : 0),
+            Size = ComputeSafeAddonSize(addon),
             Scale = addon->Scale,
             NodeCount = addon->UldManager.NodeListCount,
         };
@@ -853,8 +986,9 @@ public static class AddonInspector
                     return addon;
             }
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("TryGetAddonByName.GameGui", ex);
         }
 
         try
@@ -870,19 +1004,54 @@ public static class AddonInspector
             var addon = unitManager->GetAddonByName(addonName);
             return addon == null ? null : addon;
         }
-        catch
+        catch (Exception ex)
         {
+            DiagnosticLog.VerboseThrottled("TryGetAddonByName.Rapture", ex);
             return null;
         }
     }
 
-    private static unsafe List<AddonAtkValueInfo> ScanAtkValues(AtkUnitBase* addon)
+    private static unsafe Vector2 ComputeSafeAddonSize(AtkUnitBase* addon)
+    {
+        if (addon == null)
+            return Vector2.Zero;
+
+        var rootNode = addon->RootNode;
+        if (rootNode == null
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)rootNode, (nuint)sizeof(AtkResNode)))
+            return Vector2.Zero;
+
+        return NodeGeometry.ComputeAddonSize(rootNode->Width, rootNode->Height, addon->Scale);
+    }
+
+    internal static unsafe List<AddonAtkValueInfo> ScanAtkValues(AtkUnitBase* addon)
     {
         var results = new List<AddonAtkValueInfo>();
-        if (addon == null || addon->AtkValues == null || addon->AtkValuesCount <= 0)
+        if (addon == null
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)addon, (nuint)sizeof(AtkUnitBase))
+            || addon->AtkValues == null
+            || addon->AtkValuesCount <= 0)
             return results;
 
-        for (var i = 0; i < addon->AtkValuesCount; i++)
+        var count = (int)addon->AtkValuesCount;
+        if (!IsPlausibleNativeCount(count, MaxNativeAtkValueSlots))
+        {
+            DiagnosticLog.WarningOnce(
+                "ScanAtkValues.InvalidCount",
+                $"Skipped addon values for an implausible native count ({count}).");
+            return results;
+        }
+
+        var byteLength = (nuint)count * (nuint)sizeof(AtkValue);
+        if (!ClientStructRuntimeInspector.IsReadableRange((nint)addon->AtkValues, byteLength))
+        {
+            DiagnosticLog.WarningOnce(
+                "ScanAtkValues.UnreadableRange",
+                "Skipped an unreadable native addon-value range.");
+            return results;
+        }
+
+        for (var i = 0; i < count; i++)
         {
             var value = &addon->AtkValues[i];
             var typeRaw = (ushort)value->Type;
@@ -909,8 +1078,8 @@ public static class AddonInspector
             return value->Type switch
             {
                 0 => "(not set)",
-                AtkValueType.Int => value->Int.ToString(),
-                AtkValueType.UInt => value->UInt.ToString(),
+                AtkValueType.Int => value->Int.ToString(CultureInfo.InvariantCulture),
+                AtkValueType.UInt => value->UInt.ToString(CultureInfo.InvariantCulture),
                 AtkValueType.Bool => (value->Byte != 0).ToString(),
                 AtkValueType.Pointer => $"0x{(nint)value->Pointer:X}",
                 AtkValueType.ManagedString or AtkValueType.String or AtkValueType.ConstString
@@ -920,36 +1089,71 @@ public static class AddonInspector
         }
         catch (Exception ex)
         {
-            return $"<error: {ex.Message}>";
+            DiagnosticLog.VerboseThrottled("FormatAtkValueDisplay", ex);
+            return "<unreadable>";
         }
     }
 
-    private static unsafe List<NodeInfo> ScanNodes(AtkUnitBase* addon)
+    internal static unsafe List<NodeInfo> ScanNodes(AtkUnitBase* addon)
     {
         var nodes = new List<NodeInfo>();
-        if (addon == null) return nodes;
+        if (addon == null
+            || !ClientStructRuntimeInspector.IsReadableRange((nint)addon, (nuint)sizeof(AtkUnitBase)))
+            return nodes;
 
-        var addonPos = new Vector2(addon->X, addon->Y);
-        var count = addon->UldManager.NodeListCount;
-
-        for (var i = 0; i < count; i++)
+        var count = (int)addon->UldManager.NodeListCount;
+        if (addon->UldManager.NodeList == null || count <= 0)
+            return nodes;
+        if (!IsPlausibleNativeCount(count, MaxNativeNodeSlots))
         {
-            AtkResNode* node;
-            try { node = addon->UldManager.NodeList[i]; }
-            catch { continue; }
-            if (node == null) continue;
+            DiagnosticLog.WarningOnce(
+                "ScanNodes.InvalidCount",
+                $"Refusing an implausible native node count ({count}).");
+            return nodes;
+        }
+
+        if (!TrySnapshotPointerArray(
+                (nint)addon->UldManager.NodeList,
+                count,
+                MaxNativeNodeSlots,
+                out var nativeSlots))
+        {
+            DiagnosticLog.WarningOnce(
+                "ScanNodes.UnreadableNodeList",
+                "Skipped an invalid or unreadable native addon-node list.");
+            return nodes;
+        }
+
+        foreach (var slot in NodeProjection.Project(nativeSlots))
+        {
+            var node = (AtkResNode*)slot.Address;
+            if (!ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
+            {
+                DiagnosticLog.WarningOnce(
+                    "ScanNodes.UnreadableNode",
+                    "Skipped an unreadable native addon-node pointer.");
+                continue;
+            }
 
             var typeVal = (ushort)node->Type;
+            var geometry = NodeGeometry.ComputeNodeRect(
+                node->ScreenX,
+                node->ScreenY,
+                node->Width,
+                node->Height,
+                node->ScaleX,
+                node->ScaleY,
+                addon->Scale);
             var nodeInfo = new NodeInfo
             {
-                Index = i,
+                Index = slot.Index,
                 NodeId = node->NodeId,
                 Type = node->Type,
                 TypeRaw = typeVal,
-                IsVisible = node->IsVisible(),
+                IsVisible = node->NodeFlags.HasFlag(NodeFlags.Visible),
                 Position = new Vector2(node->X, node->Y),
-                ScreenPosition = addonPos + new Vector2(node->ScreenX - addon->X, node->ScreenY - addon->Y),
-                Size = new Vector2(node->Width, node->Height),
+                ScreenPosition = geometry.Min,
+                Size = geometry.Size,
                 Address = (nint)node,
             };
 
@@ -964,7 +1168,7 @@ public static class AddonInspector
                     nodeInfo.IsInteractive = true;
                 }
             }
-            catch { }
+            catch (Exception ex) { DiagnosticLog.VerboseThrottled("ScanNodes.Event", ex); }
 
             // Text nodes
             try
@@ -976,7 +1180,7 @@ public static class AddonInspector
                         nodeInfo.Text = textNode->NodeText.ToString() ?? "";
                 }
             }
-            catch { }
+            catch (Exception ex) { DiagnosticLog.VerboseThrottled("ScanNodes.Text", ex); }
 
             // Component node detection
             if (typeVal >= 1000)
