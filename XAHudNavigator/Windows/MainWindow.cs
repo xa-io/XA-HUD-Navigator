@@ -1612,7 +1612,7 @@ public class MainWindow : Window, IDisposable
                 foreach (var name in filtered)
                 {
                     var isSel = selectedSheetName == name;
-                    if (ImGui.Selectable(name, isSel))
+                    if (ImGui.Selectable($"{name}##LuminaAllSheet", isSel))
                     {
                         selectedSheetName = name;
                         sheetPreviewStartIndex = 0;
@@ -2053,7 +2053,7 @@ public class MainWindow : Window, IDisposable
                 foreach (var definition in filtered)
                 {
                     var isSelected = string.Equals(selectedClientStructsSheetName, definition.Name, StringComparison.Ordinal);
-                    if (ImGui.Selectable(definition.Name, isSelected))
+                    if (ImGui.Selectable($"{definition.Name}##ClientStructsAllView", isSelected))
                         SelectClientStructsSheet(definition.Name);
                     if (ImGui.IsItemClicked(ImGuiMouseButton.Right))
                         CopyAndNotify(definition.Name, definition.Name);
