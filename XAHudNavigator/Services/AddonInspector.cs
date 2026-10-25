@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Text;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 
@@ -89,6 +90,8 @@ public class NodeRuntimeReport
 
 public class AddonDebugSnapshot
 {
+    public DateTime CapturedAtUtc { get; set; } = DateTime.UtcNow;
+    public List<string> Diagnostics { get; set; } = new();
     public string Name { get; set; } = "";
     public bool IsVisible { get; set; }
     public bool IsReady { get; set; }
@@ -141,6 +144,11 @@ public static class AddonInspector
     private const int MaxNativeNodeSlots = 16384;
     private const int MaxNativeAtkValueSlots = 16384;
     private const int MaxDebugEntries = 16384;
+    private const int MaxDebugDepth = 5;
+    private const int MaxInspectionDiagnostics = 64;
+    internal const int MaxNativeStringBytes = 4096;
+    internal const int MaxNodeEvents = 32;
+    internal const int MaxNodeNativeFields = 256;
     private static readonly Dictionary<ushort, string> ComponentTypeNames = new()
     {
         { 1000, "Custom" }, { 1001, "Button" }, { 1002, "Window" },
@@ -201,6 +209,12 @@ public static class AddonInspector
     /// Always returns ALL addons (visible and hidden) for the full list.
     /// </summary>
     public static unsafe List<AddonInfo> ScanAllAddons()
+        => ScanAllAddonsCore(false);
+
+    internal static unsafe List<AddonInfo> CaptureAllAddons()
+        => ScanAllAddonsCore(true);
+
+    private static unsafe List<AddonInfo> ScanAllAddonsCore(bool reportFailure)
     {
         var results = new List<AddonInfo>();
 
@@ -286,7 +300,12 @@ public static class AddonInspector
                 results.Add(info);
             }
         }
-        catch (Exception ex) { DiagnosticLog.VerboseThrottled("ScanAllAddons", ex); }
+        catch (Exception ex)
+        {
+            DiagnosticLog.VerboseThrottled("ScanAllAddons", ex);
+            if (reportFailure)
+                throw;
+        }
 
         return results;
     }
@@ -365,14 +384,11 @@ public static class AddonInspector
             }
             else
             {
-                for (var i = 0; i < nodeSlots.Length; i++)
+                var traversal = new DebugTraversalContext(snapshot.Entries, snapshot.Diagnostics);
+                for (var i = 0; i < nodeSlots.Length && !traversal.IsExhausted; i++)
                 {
                     var node = (AtkResNode*)nodeSlots[i];
-                    if (node != null
-                        && ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
-                    {
-                        CollectDebugEntries(node, $"[{i}]", snapshot.Entries);
-                    }
+                    CollectDebugEntriesCore(node, $"[{i}]", traversal, 0);
                 }
             }
 
@@ -488,6 +504,7 @@ public static class AddonInspector
             NodeIndex = nodeIndex,
         };
 
+        AppendNodeNativeLines(report.SummaryLines, node);
         AppendEventLines(report.SummaryLines, "Node", node);
 
         var typeVal = (ushort)node->Type;
@@ -495,6 +512,11 @@ public static class AddonInspector
             return report;
 
         var componentNode = (AtkComponentNode*)node;
+        if (!IsReadable(componentNode))
+        {
+            report.SummaryLines.Add("Component Node: <unreadable>");
+            return report;
+        }
         if (componentNode->Component == null)
         {
             report.SummaryLines.Add("Component Address: 0x0");
@@ -535,6 +557,115 @@ public static class AddonInspector
         return report;
     }
 
+    internal static unsafe void AppendNodeNativeLines(List<string> lines, AtkResNode* node)
+    {
+        if (!IsReadable(node))
+        {
+            lines.Add("Native Node: <unreadable>");
+            return;
+        }
+
+        var (type, size) = node->Type switch
+        {
+            NodeType.Image => (typeof(AtkImageNode), sizeof(AtkImageNode)),
+            NodeType.NineGrid => (typeof(AtkNineGridNode), sizeof(AtkNineGridNode)),
+            NodeType.Text => (typeof(AtkTextNode), sizeof(AtkTextNode)),
+            NodeType.Counter => (typeof(AtkCounterNode), sizeof(AtkCounterNode)),
+            _ when (ushort)node->Type >= 1000 => (typeof(AtkComponentNode), sizeof(AtkComponentNode)),
+            _ => (typeof(AtkResNode), sizeof(AtkResNode)),
+        };
+
+        if (!ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)size))
+        {
+            lines.Add($"Native Node ({type.Name}): <unreadable derived fields>");
+            return;
+        }
+
+        try
+        {
+            var snapshot = ClientStructRuntimeInspector.SnapshotStruct(
+                "Native Node", $"NodeId {node->NodeId}", (nint)node, type,
+                $"Concrete node layout selected from NodeType {(ushort)node->Type}.");
+            lines.Add($"Native Node: {snapshot.TypeName} | Addr=0x{snapshot.Address:X} | Size=0x{snapshot.Size:X}");
+            lines.Add(snapshot.ResolutionInfo);
+            var count = Math.Min(snapshot.Fields.Count, MaxNodeNativeFields);
+            for (var index = 0; index < count; index++)
+                lines.Add(ClientStructRuntimeInspector.FormatFieldEntry(snapshot.Fields[index]));
+            if (snapshot.IsTruncated || snapshot.Fields.Count > count)
+                lines.Add($"Native Node: field preview truncated after {count} rows.");
+
+            if (node->Type == NodeType.Image)
+            {
+                var image = (AtkImageNode*)node;
+                AppendImageResourceLines(lines, image->PartsList, image->PartId);
+            }
+            else if (node->Type == NodeType.NineGrid)
+            {
+                var nineGrid = (AtkNineGridNode*)node;
+                AppendImageResourceLines(lines, nineGrid->PartsList, nineGrid->PartId);
+            }
+        }
+        catch (Exception ex)
+        {
+            lines.Add($"Native Node ({type.Name}): <inspection unavailable>");
+            DiagnosticLog.VerboseThrottled("AppendNodeNativeLines", ex);
+        }
+    }
+
+    internal static unsafe void AppendImageResourceLines(List<string> lines, AtkUldPartsList* partsList, uint partId)
+    {
+        if (partsList == null)
+        {
+            lines.Add("Image Parts: <none>");
+            return;
+        }
+        if (!IsReadable(partsList))
+        {
+            lines.Add("Image Parts: <unreadable>");
+            return;
+        }
+
+        var partCount = partsList->PartCount;
+        lines.Add($"Image Parts: ListId={partsList->Id} | Count={partCount} | SelectedPart={partId} | Addr=0x{(nint)partsList:X}");
+        if (partCount > MaxNativeNodeSlots || partId >= partCount)
+        {
+            lines.Add("Image Part: <invalid count or selected index>");
+            return;
+        }
+        if (!ClientStructRuntimeInspector.TryAddAddress((nint)partsList->Parts, checked((int)partId * sizeof(AtkUldPart)), out var partAddress)
+            || !IsReadable((AtkUldPart*)partAddress))
+        {
+            lines.Add("Image Part: <unreadable>");
+            return;
+        }
+
+        var part = (AtkUldPart*)partAddress;
+        lines.Add($"Image Part: U={part->U} V={part->V} Width={part->Width} Height={part->Height} | Addr=0x{partAddress:X}");
+        var asset = part->UldAsset;
+        if (!IsReadable(asset))
+        {
+            lines.Add(asset == null ? "Image Asset: <none>" : "Image Asset: <unreadable>");
+            return;
+        }
+
+        var texture = &asset->AtkTexture;
+        lines.Add($"Image Asset: Id={asset->Id} | TextureType={texture->TextureType} | Addr=0x{(nint)asset:X}");
+        if (texture->TextureType != TextureType.Resource)
+        {
+            lines.Add("Image Resource: unavailable for this texture type.");
+            return;
+        }
+        var resource = texture->Resource;
+        if (!IsReadable(resource))
+        {
+            lines.Add(resource == null ? "Image Resource: <none>" : "Image Resource: <unreadable>");
+            return;
+        }
+
+        lines.Add($"Image Resource: IconId={resource->IconId} | PathHash=0x{resource->TexPathHash:X8} | Addr=0x{(nint)resource:X}");
+        lines.Add($"Image Resource Handles: File=0x{(nint)resource->TexFileResourceHandle:X} | KernelTexture=0x{(nint)resource->KernelTextureObject:X}");
+    }
+
     public static string BuildNodeRuntimeReportText(NodeRuntimeReport report)
     {
         var lines = new List<string>
@@ -551,12 +682,32 @@ public static class AddonInspector
     }
 
     private static unsafe void CollectDebugEntries(AtkResNode* node, string path, List<AddonDebugEntry> results, int depth = 0)
+        => CollectDebugEntriesCore(node, path, new DebugTraversalContext(results, new List<string>()), depth);
+
+    internal static unsafe void CollectDebugNodeSnapshot(AtkResNode* node, List<AddonDebugEntry> results, List<string> diagnostics)
+        => CollectDebugEntriesCore(node, "[0]", new DebugTraversalContext(results, diagnostics), 0);
+
+    private static unsafe void CollectDebugEntriesCore(AtkResNode* node, string path, DebugTraversalContext context, int depth)
     {
-        if (node == null
-            || depth > 5
-            || results.Count >= MaxDebugEntries
-            || !ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
+        if (node == null)
             return;
+        if (!context.TakeVisit())
+            return;
+        if (depth > MaxDebugDepth || context.Entries.Count >= MaxDebugEntries)
+        {
+            context.AddDiagnostic($"{path}: traversal stopped at the depth or entry limit.");
+            return;
+        }
+        if (!IsReadable(node))
+        {
+            context.AddDiagnostic($"{path}: unreadable node {FormatPointer((nint)node)}.");
+            return;
+        }
+        if (!context.Visited.Add((nint)node))
+        {
+            context.AddDiagnostic($"{path}: repeated node {FormatPointer((nint)node)} skipped (shared reference or cycle).");
+            return;
+        }
 
         var typeVal = (ushort)node->Type;
         var displayPath = node->Type == NodeType.Counter ? $"{path}[ctr]" : path;
@@ -581,39 +732,26 @@ public static class AddonInspector
             Address = (nint)node,
         };
 
-        try
+        if (TryReadFirstEvent(node, out var eventParam, out _, out var eventError))
         {
-            var evt = node->AtkEventManager.Event;
-            if (evt != null)
-            {
-                entry.HasEvents = true;
-                entry.EventParam = evt->Param;
-                entry.IsInteractive = true;
-            }
+            entry.HasEvents = true;
+            entry.EventParam = eventParam;
+            entry.IsInteractive = true;
         }
-        catch (Exception ex) { DiagnosticLog.VerboseThrottled("CollectDebugEntries.Event", ex); }
+        else if (!string.IsNullOrEmpty(eventError))
+            context.AddDiagnostic($"{path}: {eventError}");
 
-        try
-        {
-            if (node->Type == NodeType.Text)
-            {
-                var textNode = (AtkTextNode*)node;
-                if (textNode->NodeText.StringPtr.HasValue)
-                    entry.Text = textNode->NodeText.ToString() ?? "";
-            }
-            else if (node->Type == NodeType.Counter)
-            {
-                var counterNode = (AtkCounterNode*)node;
-                entry.Text = counterNode->NodeText.ToString() ?? "";
-            }
-        }
-        catch (Exception ex) { DiagnosticLog.VerboseThrottled("CollectDebugEntries.Text", ex); }
-
-        results.Add(entry);
+        entry.Text = TryGetNodeText(node);
+        context.Entries.Add(entry);
 
         if (typeVal >= 1000)
         {
             var compNode = (AtkComponentNode*)node;
+            if (!IsReadable(compNode))
+            {
+                context.AddDiagnostic($"{path}: unreadable component-node fields.");
+                return;
+            }
             if (compNode->Component != null
                 && ClientStructRuntimeInspector.IsReadableRange(
                     (nint)compNode->Component,
@@ -621,25 +759,60 @@ public static class AddonInspector
             {
                 entry.ComponentAddress = (nint)compNode->Component;
                 var childCount = (int)compNode->Component->UldManager.NodeListCount;
+                if (!IsPlausibleNativeCount(childCount, MaxNativeNodeSlots))
+                {
+                    context.AddDiagnostic($"{path}: invalid component-node count ({childCount}).");
+                    return;
+                }
+                var inspectedChildCount = Math.Min(childCount, context.RemainingVisits);
+                if (inspectedChildCount < childCount)
+                    context.AddDiagnostic($"{path}: child list truncated to the remaining traversal budget ({inspectedChildCount}/{childCount}).");
                 if (!TrySnapshotPointerArray(
                         (nint)compNode->Component->UldManager.NodeList,
-                        childCount,
+                        inspectedChildCount,
                         MaxNativeNodeSlots,
                         out var childSlots))
                 {
                     DiagnosticLog.WarningOnce(
                         "CollectDebugEntries.InvalidChildList",
                         $"Skipped an invalid or unreadable recursive component-node list ({childCount} slots).");
+                    context.AddDiagnostic($"{path}: invalid or unreadable component-node list ({childCount} slots).");
                     return;
                 }
 
-                for (var i = 0; i < childSlots.Length; i++)
+                for (var i = 0; i < childSlots.Length && !context.IsExhausted; i++)
                 {
                     var child = (AtkResNode*)childSlots[i];
                     if (child != null)
-                        CollectDebugEntries(child, $"{path}→[{i}]", results, depth + 1);
+                        CollectDebugEntriesCore(child, $"{path}→[{i}]", context, depth + 1);
                 }
             }
+            else if (compNode->Component != null)
+                context.AddDiagnostic($"{path}: unreadable component {FormatPointer((nint)compNode->Component)}.");
+        }
+    }
+
+    private sealed class DebugTraversalContext(List<AddonDebugEntry> entries, List<string> diagnostics)
+    {
+        internal List<AddonDebugEntry> Entries { get; } = entries;
+        internal HashSet<nint> Visited { get; } = new();
+        internal int RemainingVisits { get; private set; } = MaxDebugEntries;
+        internal bool IsExhausted => RemainingVisits <= 0;
+
+        internal bool TakeVisit()
+        {
+            if (IsExhausted)
+                return false;
+            RemainingVisits--;
+            if (IsExhausted)
+                AddDiagnostic("The node traversal limit was reached; remaining references were omitted.");
+            return true;
+        }
+
+        internal void AddDiagnostic(string message)
+        {
+            if (diagnostics.Count < MaxInspectionDiagnostics)
+                diagnostics.Add(message);
         }
     }
 
@@ -672,16 +845,12 @@ public static class AddonInspector
             var childType = (ushort)child->Type;
             var line = $"[{i}] #{child->NodeId} {GetNodeTypeDisplay(child->Type, childType)} | Visible={child->NodeFlags.HasFlag(NodeFlags.Visible)}";
 
-            try
+            if (TryReadFirstEvent(child, out var eventParam, out var eventAddress, out var eventError))
             {
-                var evt = child->AtkEventManager.Event;
-                if (evt != null)
-                    line += $" | event:{evt->Param} @ 0x{(nint)evt:X}";
+                line += $" | event:{eventParam} @ 0x{eventAddress:X}";
             }
-            catch (Exception ex)
-            {
-                DiagnosticLog.VerboseThrottled("AppendComponentChildLines.Event", ex);
-            }
+            else if (!string.IsNullOrEmpty(eventError))
+                line += $" | Event: {eventError}";
 
             var text = TryGetNodeText(child);
             if (!string.IsNullOrWhiteSpace(text))
@@ -702,6 +871,11 @@ public static class AddonInspector
 
         var itemCount = treeList->GetItemCount();
         report.TreeListLines.Add($"Item Count: {itemCount}");
+        if (itemCount < 0)
+        {
+            report.TreeListLines.Add("Renderer inspection skipped: invalid item count.");
+            return;
+        }
         report.TreeListLines.Add($"List Length: {treeList->ListLength}");
         report.TreeListLines.Add($"Selected Item Index: {treeList->SelectedItemIndex}");
         report.TreeListLines.Add($"Held Item Index: {treeList->HeldItemIndex}");
@@ -746,7 +920,8 @@ public static class AddonInspector
         if (visibleItems <= 0)
             visibleItems = Math.Min(itemCount, 6);
 
-        var lastExclusive = Math.Min(itemCount, firstVisible + Math.Max(visibleItems, 1));
+        var rowsToInspect = Math.Min(Math.Max(visibleItems, 1), 128);
+        var lastExclusive = (int)Math.Min(itemCount, (long)firstVisible + rowsToInspect);
         for (var i = firstVisible; i < lastExclusive && report.TreeListRendererLines.Count < 10; i++)
         {
             AtkComponentListItemRenderer* renderer;
@@ -760,28 +935,37 @@ public static class AddonInspector
                 continue;
             }
 
-            if (renderer == null)
-                continue;
-
-            var componentNode = renderer->GetComponentNode();
-            var activeNode = renderer->GetActiveNode();
-            var text = renderer->ButtonTextNode != null ? renderer->ButtonTextNode->NodeText.ToString() ?? string.Empty : string.Empty;
-            var line = $"Row {i} | Renderer={FormatPointer((nint)renderer)} | Owner={FormatPointer((nint)renderer->OwnerNode)} " +
-                       $"| ComponentNode={FormatPointer((nint)componentNode)} | ActiveNode={FormatPointer((nint)activeNode)}";
-
-            if (renderer->ButtonTextNode != null)
-                line += $" | TextNode={FormatPointer((nint)renderer->ButtonTextNode)}";
-            if (!string.IsNullOrWhiteSpace(text))
-                line += $" | Text=\"{TrimForLine(text)}\"";
-            if (renderer->ButtonBGNode != null)
-                line += $" | BGNode={FormatPointer((nint)renderer->ButtonBGNode)}";
-
-            line += $" | IsActive={renderer->IsActive}";
-            report.TreeListRendererLines.Add(line);
+            AppendTreeListRendererLine(report.TreeListRendererLines, i, renderer);
         }
     }
 
-    private static unsafe void AppendEventLines(List<string> lines, string label, AtkResNode* node)
+    internal static unsafe void AppendTreeListRendererLine(List<string> lines, int index, AtkComponentListItemRenderer* renderer)
+    {
+        if (!IsReadable(renderer))
+        {
+            if (renderer != null)
+                lines.Add($"Row {index} | Renderer={FormatPointer((nint)renderer)} | <unreadable>");
+            return;
+        }
+
+        var componentNode = renderer->GetComponentNode();
+        var activeNode = renderer->GetActiveNode();
+        var text = TryGetNodeText((AtkResNode*)renderer->ButtonTextNode);
+        var line = $"Row {index} | Renderer={FormatPointer((nint)renderer)} | Owner={FormatPointer((nint)renderer->OwnerNode)} " +
+                   $"| ComponentNode={FormatPointer((nint)componentNode)} | ActiveNode={FormatPointer((nint)activeNode)}";
+
+        if (renderer->ButtonTextNode != null)
+            line += $" | TextNode={FormatPointer((nint)renderer->ButtonTextNode)}";
+        if (!string.IsNullOrWhiteSpace(text))
+            line += $" | Text=\"{TrimForLine(text)}\"";
+        if (renderer->ButtonBGNode != null)
+            line += $" | BGNode={FormatPointer((nint)renderer->ButtonBGNode)}";
+
+        line += $" | IsActive={renderer->IsActive}";
+        lines.Add(line);
+    }
+
+    internal static unsafe void AppendEventLines(List<string> lines, string label, AtkResNode* node)
     {
         if (node == null
             || !ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
@@ -796,8 +980,30 @@ public static class AddonInspector
                 return;
             }
 
-            lines.Add($"{label} Event: 0x{(nint)evt:X}");
-            lines.Add($"{label} Event Param: {evt->Param}");
+            var visited = new HashSet<nint>();
+            for (var index = 0; evt != null; index++)
+            {
+                if (index >= MaxNodeEvents)
+                {
+                    lines.Add($"{label} Events: truncated after {MaxNodeEvents} entries.");
+                    break;
+                }
+                if (!visited.Add((nint)evt))
+                {
+                    lines.Add($"{label} Events: cycle at {FormatPointer((nint)evt)}.");
+                    break;
+                }
+                if (!IsReadable(evt))
+                {
+                    lines.Add($"{label} Event: {FormatPointer((nint)evt)} <unreadable>");
+                    break;
+                }
+                var eventLabel = index == 0 ? label : $"{label} [{index}]";
+                lines.Add($"{eventLabel} Event: 0x{(nint)evt:X}");
+                lines.Add($"{eventLabel} Event Param: {evt->Param}");
+                lines.Add($"{eventLabel} Listener: {FormatPointer((nint)evt->Listener)} | Target: {FormatPointer((nint)evt->Target)}");
+                evt = evt->NextEvent;
+            }
         }
         catch (Exception ex)
         {
@@ -806,7 +1012,7 @@ public static class AddonInspector
         }
     }
 
-    private static unsafe string TryGetNodeText(AtkResNode* node)
+    internal static unsafe string TryGetNodeText(AtkResNode* node)
     {
         if (node == null
             || !ClientStructRuntimeInspector.IsReadableRange((nint)node, (nuint)sizeof(AtkResNode)))
@@ -817,13 +1023,17 @@ public static class AddonInspector
             if (node->Type == NodeType.Text)
             {
                 var textNode = (AtkTextNode*)node;
-                return textNode->NodeText.StringPtr.HasValue ? textNode->NodeText.ToString() ?? string.Empty : string.Empty;
+                return IsReadable(textNode)
+                    ? ReadNativeString((nint)textNode->NodeText.StringPtr.Value)
+                    : "<unreadable text node>";
             }
 
             if (node->Type == NodeType.Counter)
             {
                 var counterNode = (AtkCounterNode*)node;
-                return counterNode->NodeText.ToString() ?? string.Empty;
+                return IsReadable(counterNode)
+                    ? ReadNativeString((nint)counterNode->NodeText.StringPtr.Value)
+                    : "<unreadable counter node>";
             }
         }
         catch (Exception ex)
@@ -832,6 +1042,77 @@ public static class AddonInspector
         }
 
         return string.Empty;
+    }
+
+    private static unsafe bool IsReadable<T>(T* value) where T : unmanaged
+        => value != null && ClientStructRuntimeInspector.IsReadableRange((nint)value, (nuint)sizeof(T));
+
+    internal static unsafe bool TryReadFirstEvent(AtkResNode* node, out uint param, out nint address, out string error)
+    {
+        param = 0;
+        address = 0;
+        error = string.Empty;
+        if (!IsReadable(node))
+        {
+            error = "unreadable event owner";
+            return false;
+        }
+        var evt = node->AtkEventManager.Event;
+        if (evt == null)
+            return false;
+        address = (nint)evt;
+        if (!IsReadable(evt))
+        {
+            error = $"unreadable event {FormatPointer(address)}";
+            return false;
+        }
+        param = evt->Param;
+        return true;
+    }
+
+    internal static string ReadNativeString(nint address, bool wide = false)
+    {
+        if (address == 0)
+            return string.Empty;
+
+        // Validate each page before reading it, allowing a terminator before an unreadable next page.
+        var stride = wide ? 2 : 1;
+        var bytes = new byte[MaxNativeStringBytes];
+        var length = 0;
+        try
+        {
+            while (length < bytes.Length)
+            {
+                if (!ClientStructRuntimeInspector.TryAddAddress(address, length, out var current))
+                    return "<unreadable>";
+                var pageRemaining = Environment.SystemPageSize - (int)((nuint)current % (nuint)Environment.SystemPageSize);
+                var chunkBytes = Math.Min(bytes.Length - length, pageRemaining);
+                // A misaligned UTF-16 code unit can straddle a page boundary.
+                if (chunkBytes < stride)
+                    chunkBytes = stride;
+                chunkBytes -= chunkBytes % stride;
+                if (!ClientStructRuntimeInspector.IsReadableRange(current, (nuint)chunkBytes))
+                    return "<unreadable>";
+
+                var chunkEnd = Math.Min(bytes.Length, length + chunkBytes);
+                while (length < chunkEnd)
+                {
+                    var first = Marshal.ReadByte(address, length);
+                    var second = wide ? Marshal.ReadByte(address, length + 1) : (byte)0;
+                    if (first == 0 && second == 0)
+                        return (wide ? Encoding.Unicode : Encoding.UTF8).GetString(bytes, 0, length);
+                    bytes[length++] = first;
+                    if (wide)
+                        bytes[length++] = second;
+                }
+            }
+            return (wide ? Encoding.Unicode : Encoding.UTF8).GetString(bytes) + "… <truncated>";
+        }
+        catch (Exception ex)
+        {
+            DiagnosticLog.VerboseThrottled("AddonInspector.ReadNativeString", ex);
+            return "<unreadable>";
+        }
     }
 
     private static string TrimForLine(string text, int maxLength = 72)
@@ -1078,13 +1359,23 @@ public static class AddonInspector
             return value->Type switch
             {
                 0 => "(not set)",
+                AtkValueType.Null => "(null)",
                 AtkValueType.Int => value->Int.ToString(CultureInfo.InvariantCulture),
+                AtkValueType.Int64 => value->Int64.ToString(CultureInfo.InvariantCulture),
                 AtkValueType.UInt => value->UInt.ToString(CultureInfo.InvariantCulture),
+                AtkValueType.UInt64 => value->UInt64.ToString(CultureInfo.InvariantCulture),
+                AtkValueType.Float => value->Float.ToString("G9", CultureInfo.InvariantCulture),
                 AtkValueType.Bool => (value->Byte != 0).ToString(),
                 AtkValueType.Pointer => $"0x{(nint)value->Pointer:X}",
                 AtkValueType.ManagedString or AtkValueType.String or AtkValueType.ConstString
-                    => value->String.Value == null ? "null" : value->String.ToString() ?? string.Empty,
-                _ => $"Unhandled type {value->Type}"
+                    => value->String.Value == null ? "null" : ReadNativeString((nint)value->String.Value),
+                AtkValueType.WideString
+                    => value->WideString == null ? "null" : ReadNativeString((nint)value->WideString, true),
+                AtkValueType.Vector or AtkValueType.ManagedVector
+                    => $"Vector @ {FormatPointer((nint)value->Vector)} (contents not traversed)",
+                AtkValueType.AtkValues
+                    => $"AtkValues @ {FormatPointer((nint)value->AtkValues)} (count unavailable)",
+                _ => $"Unsupported type {value->Type} ({(ushort)value->Type})"
             };
         }
         catch (Exception ex)
@@ -1157,30 +1448,14 @@ public static class AddonInspector
                 Address = (nint)node,
             };
 
-            // Check for events (interactive)
-            try
+            // Read the event storage independently of the node's readable range.
+            if (TryReadFirstEvent(node, out var eventParam, out _, out _))
             {
-                var evt = node->AtkEventManager.Event;
-                if (evt != null)
-                {
-                    nodeInfo.HasEvents = true;
-                    nodeInfo.EventParam = evt->Param;
-                    nodeInfo.IsInteractive = true;
-                }
+                nodeInfo.HasEvents = true;
+                nodeInfo.EventParam = eventParam;
+                nodeInfo.IsInteractive = true;
             }
-            catch (Exception ex) { DiagnosticLog.VerboseThrottled("ScanNodes.Event", ex); }
-
-            // Text nodes
-            try
-            {
-                if (node->Type == NodeType.Text)
-                {
-                    var textNode = (AtkTextNode*)node;
-                    if (textNode->NodeText.StringPtr.HasValue)
-                        nodeInfo.Text = textNode->NodeText.ToString() ?? "";
-                }
-            }
-            catch (Exception ex) { DiagnosticLog.VerboseThrottled("ScanNodes.Text", ex); }
+            nodeInfo.Text = TryGetNodeText(node);
 
             // Component node detection
             if (typeVal >= 1000)

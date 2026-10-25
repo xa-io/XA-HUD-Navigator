@@ -50,6 +50,21 @@ public class MainWindow : Window, IDisposable
     private bool debugVisibleOnly;
     private AddonDebugSnapshot? cachedDebugSnapshot;
     private string? cachedDebugAddonName;
+    private bool debugAutoRefresh = true;
+    private bool debugRefreshRequested;
+    private readonly ObjectExplorerView objectExplorer;
+    private readonly UiExplorerView uiExplorer;
+    private bool switchToLuminaAll;
+    private readonly FrameworkReadSlot<(DateTime CapturedAtUtc, ClientStructsSheetSnapshot Snapshot)> sheetRead = new();
+    private readonly FrameworkReadSlot<ClientStructsSearchProgress> searchRead = new();
+    private IEnumerator<ClientStructsSearchProgress>? runtimeSearch;
+    private int searchVersion;
+    private int runtimeSearchVersion = -1;
+    private int retireRuntimeSearch;
+    private (uint Territory, uint Map, bool LoggedIn) runtimeSearchContext;
+    private ClientStructsSearchResult? pendingSearchSelection;
+    private DateTime lastDebugAttempt;
+    private string runtimeReadError = string.Empty;
 
     // Hover state — which node row is hovered in the table (for overlay pulsation)
 
@@ -100,6 +115,9 @@ public class MainWindow : Window, IDisposable
         : base("XA HUD Navigator##XAHudNavigator", ImGuiWindowFlags.None)
     {
         this.plugin = plugin;
+        objectExplorer = new ObjectExplorerView(plugin.ObjectSnapshots, OpenObjectSheet);
+        uiExplorer = new UiExplorerView(plugin.MenuSnapshots, OpenObjectSheet);
+        Plugin.Framework.Update += OnDebugCaptureTick;
         InhibitAtkCollision = true;
         UpdateSizeConstraints(ImGuiHelpers.GlobalScale);
     }
@@ -109,8 +127,23 @@ public class MainWindow : Window, IDisposable
         UpdateSizeConstraints(UiScale);
     }
 
+    public override void OnClose()
+    {
+        plugin.ObjectSnapshots.Stop();
+        plugin.MenuSnapshots.Stop();
+        sheetRead.Cancel();
+        searchRead.Cancel();
+        searchVersion++;
+        System.Threading.Interlocked.Exchange(ref retireRuntimeSearch, 1);
+        clientStructsMasterSearchStatus = "Search stopped when the window closed; retained results are historical. Press Search to refresh.";
+    }
+
     public void Dispose()
     {
+        Plugin.Framework.Update -= OnDebugCaptureTick;
+        sheetRead.Dispose();
+        searchRead.Dispose();
+        runtimeSearch?.Dispose();
         if (clickTrackFrameworkHooked)
         {
             Plugin.Framework.Update -= OnClickTrackTick;
@@ -129,8 +162,22 @@ public class MainWindow : Window, IDisposable
         copiedExpiry = DateTime.UtcNow.AddSeconds(3);
     }
 
+    private void OpenObjectSheet(string sheet, uint rowId)
+    {
+        plugin.Configuration.ShowSheetsTab = true;
+        switchToSheetsTab = true;
+        switchToLuminaAll = true;
+        selectedSheetName = sheet;
+        sheetPreviewRowId = rowId;
+        selectedSheetPreviewRow = -1;
+        selectedSheetPreviewColumn = -1;
+        ReadSheetRow(sheet, rowId, true);
+    }
+
     public override void Draw()
     {
+        sheetRead.Apply();
+        searchRead.Apply();
         cachedAddons = plugin.AddonSnapshots.Current.Addons;
 
         // ── Top bar ──
@@ -142,6 +189,16 @@ public class MainWindow : Window, IDisposable
             if (ImGui.BeginTabItem("Addons"))
             {
                 DrawAddonsTab();
+                ImGui.EndTabItem();
+            }
+            if (ImGui.BeginTabItem("Objects"))
+            {
+                objectExplorer.Draw();
+                ImGui.EndTabItem();
+            }
+            if (ImGui.BeginTabItem("UI Explorer"))
+            {
+                uiExplorer.Draw();
                 ImGui.EndTabItem();
             }
             if (plugin.Configuration.ShowSheetsTab)
@@ -308,6 +365,9 @@ public class MainWindow : Window, IDisposable
         }
 
         ImGui.Separator();
+        var addonFrame = plugin.AddonSnapshots.Current;
+        if (!addonFrame.IsCurrent)
+            ImGui.TextWrapped($"Addon capture: {addonFrame.CaptureStatus}. {addonFrame.Error} Retained values are historical; overlay is suppressed.");
     }
 
     // ═══════════════════════════════════════════════════
@@ -768,7 +828,7 @@ public class MainWindow : Window, IDisposable
         var snapshot = GetDebugSnapshot();
         if (snapshot == null)
         {
-            ImGui.TextColored(new Vector4(1f, 0.4f, 0.4f, 1f), $"Unable to scan '{selectedAddonName}' for debug data.");
+            ImGui.TextColored(new Vector4(1f, 0.8f, 0.4f, 1f), $"Waiting for a current Framework snapshot of '{selectedAddonName}'.");
             if (ImGui.SmallButton("Retry Snapshot"))
                 RefreshDebugSnapshot();
             return;
@@ -790,6 +850,10 @@ public class MainWindow : Window, IDisposable
             CopyAndNotify(BuildDebugReport(snapshot, filteredEntries, debugFilter), "Filtered debug dump");
 
         ImGui.TextDisabled("Recursive paths mirror XA addon-reader paths, while the right pane resolves live addon runtime data, generic AtkUnitBase fields, and agent/addon ClientStructs from the same selected addon.");
+        ImGui.Checkbox("Auto-refresh debug", ref debugAutoRefresh);
+        ImGui.SameLine();
+        ImGui.TextDisabled($"Captured {snapshot.CapturedAtUtc:HH:mm:ss} UTC ({Math.Max(0, (DateTime.UtcNow - snapshot.CapturedAtUtc).TotalSeconds):F1}s ago)");
+        foreach (var diagnostic in snapshot.Diagnostics) ImGui.TextWrapped(diagnostic);
         ImGui.Separator();
 
         ImGui.SetNextItemWidth(Scale(220f));
@@ -1008,15 +1072,39 @@ public class MainWindow : Window, IDisposable
 
     private void RefreshDebugSnapshot()
     {
-        if (string.IsNullOrEmpty(selectedAddonName))
+        debugRefreshRequested = true;
+    }
+
+    private void OnDebugCaptureTick(IFramework framework)
+    {
+        if (System.Threading.Interlocked.Exchange(ref retireRuntimeSearch, 0) != 0)
+        {
+            runtimeSearch?.Dispose();
+            runtimeSearch = null;
+            runtimeSearchVersion = -1;
+        }
+        if (!IsOpen) return;
+        sheetRead.Capture();
+        searchRead.Capture();
+        if (!plugin.Configuration.ShowDebugTab) return;
+        var frame = plugin.AddonSnapshots.Current;
+        var addon = frame.IsCurrent ? frame.Addons.FirstOrDefault(a => a.Name == selectedAddonName) : null;
+        if (addon == null)
         {
             cachedDebugSnapshot = null;
             cachedDebugAddonName = null;
             return;
         }
-
-        cachedDebugSnapshot = AddonInspector.ScanDebugAddon(selectedAddonName);
-        cachedDebugAddonName = selectedAddonName;
+        if (!debugRefreshRequested && cachedDebugSnapshot != null && cachedDebugAddonName == selectedAddonName
+            && cachedDebugSnapshot.Address == addon.Address
+            && (!debugAutoRefresh || (DateTime.UtcNow - cachedDebugSnapshot.CapturedAtUtc).TotalSeconds < Math.Max(.5, plugin.Configuration.RefreshInterval))) return;
+        if (!debugRefreshRequested && cachedDebugSnapshot == null
+            && DateTime.UtcNow >= lastDebugAttempt
+            && (DateTime.UtcNow - lastDebugAttempt).TotalSeconds < Math.Max(.5, plugin.Configuration.RefreshInterval)) return;
+        debugRefreshRequested = false;
+        lastDebugAttempt = DateTime.UtcNow;
+        cachedDebugSnapshot = AddonInspector.ScanDebugAddon(addon.Name);
+        cachedDebugAddonName = addon.Name;
     }
 
     private AddonDebugSnapshot? GetDebugSnapshot()
@@ -1024,8 +1112,11 @@ public class MainWindow : Window, IDisposable
         if (string.IsNullOrEmpty(selectedAddonName))
             return null;
 
-        if (cachedDebugSnapshot == null || cachedDebugAddonName != selectedAddonName)
+        if (cachedDebugAddonName != selectedAddonName)
+        {
             RefreshDebugSnapshot();
+            return null;
+        }
 
         return cachedDebugSnapshot;
     }
@@ -1489,7 +1580,7 @@ public class MainWindow : Window, IDisposable
 
         if (ImGui.BeginTabBar("SheetsTabs"))
         {
-            if (ImGui.BeginTabItem("Lumina Sheets"))
+            if (ImGui.BeginTabItem("Lumina Sheets", switchToLuminaAll ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
             {
                 DrawLuminaSheetsWorkspace();
                 ImGui.EndTabItem();
@@ -1512,8 +1603,9 @@ public class MainWindow : Window, IDisposable
                 DrawCommonSheetsView();
                 ImGui.EndTabItem();
             }
-            if (ImGui.BeginTabItem($"All Sheets ({cachedSheetNames?.Count ?? 0})"))
+            if (ImGui.BeginTabItem($"All Sheets ({cachedSheetNames?.Count ?? 0})", switchToLuminaAll ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None))
             {
+                switchToLuminaAll = false;
                 DrawAllSheetsView();
                 ImGui.EndTabItem();
             }
@@ -2177,6 +2269,8 @@ public class MainWindow : Window, IDisposable
 
         if (trimmedFilter.Length < 3)
         {
+            searchVersion++;
+            searchRead.Cancel();
             clientStructsMasterSearchResults.Clear();
             selectedClientStructsMasterSearchResult = -1;
             clientStructsMasterSearchLastQuery = trimmedFilter;
@@ -2191,19 +2285,42 @@ public class MainWindow : Window, IDisposable
             && clientStructsMasterSearchResults.Count > 0)
             return;
 
-        clientStructsMasterSearchResults = clientStructsSheetService.SearchAllSheets(trimmedFilter, new ClientStructsSheetRequest
-        {
-            StartIndex = 0,
-            RowCount = 100,
-            InventoryType = clientStructsInventoryType
-        });
-
+        var request = new ClientStructsSheetRequest { StartIndex = 0, RowCount = 100, InventoryType = clientStructsInventoryType };
+        var version = ++searchVersion;
         clientStructsMasterSearchLastQuery = trimmedFilter;
-        clientStructsMasterSearchLastRefresh = DateTime.UtcNow;
-        selectedClientStructsMasterSearchResult = clientStructsMasterSearchResults.Count > 0 ? 0 : -1;
-        clientStructsMasterSearchStatus = clientStructsMasterSearchResults.Count == 0
-            ? $"No ClientStructs matches found for '{trimmedFilter}'."
-            : $"Found {clientStructsMasterSearchResults.Count} ClientStructs match(es) for '{trimmedFilter}'.";
+        clientStructsMasterSearchResults = new();
+        selectedClientStructsMasterSearchResult = -1;
+        clientStructsMasterSearchStatus = "Searching one runtime page per Framework update...";
+        QueueRuntimeSearch(trimmedFilter, request, version);
+    }
+
+    private void QueueRuntimeSearch(string filter, ClientStructsSheetRequest request, int version)
+    {
+        searchRead.Request(() =>
+        {
+            if (runtimeSearchVersion != version)
+            {
+                runtimeSearch?.Dispose();
+                runtimeSearch = clientStructsSheetService.StartSearch(filter, request);
+                runtimeSearchVersion = version;
+                runtimeSearchContext = (Plugin.ClientState.TerritoryType, Plugin.ClientState.MapId, Plugin.ClientState.IsLoggedIn);
+            }
+            if (runtimeSearchContext != (Plugin.ClientState.TerritoryType, Plugin.ClientState.MapId, Plugin.ClientState.IsLoggedIn))
+            {
+                runtimeSearch!.Dispose();
+                return new ClientStructsSearchProgress(new(), true, 0, "World context changed during search. Press Search to start a new capture.", true);
+            }
+            return runtimeSearch!.MoveNext() ? runtimeSearch.Current
+                : new ClientStructsSearchProgress(new(), true, 0, "Search finished.");
+        }, progress =>
+        {
+            if (version != searchVersion) return;
+            clientStructsMasterSearchResults = progress.Results;
+            clientStructsMasterSearchLastRefresh = DateTime.UtcNow;
+            selectedClientStructsMasterSearchResult = progress.Results.Count > 0 ? Math.Clamp(selectedClientStructsMasterSearchResult, 0, progress.Results.Count - 1) : -1;
+            clientStructsMasterSearchStatus = progress.Status;
+            if (!progress.IsComplete) QueueRuntimeSearch(filter, request, version);
+        }, ex => clientStructsMasterSearchStatus = $"Search failed: {ex.Message}");
     }
 
     private void DrawClientStructsMasterSearchSelection()
@@ -2277,18 +2394,8 @@ public class MainWindow : Window, IDisposable
             ? Math.Max(0, result.RowIndex - Math.Min(3, Math.Max(5, clientStructsPreviewRowCount) / 3))
             : 0;
 
+        pendingSearchSelection = result;
         RefreshSelectedClientStructsSheet(true);
-
-        var snapshot = clientStructsSheetSnapshot;
-        if (snapshot != null && result.RowIndex >= 0)
-        {
-            var rowListIndex = snapshot.Rows.FindIndex(row => row.RowIndex == result.RowIndex && (result.RowId == 0 || row.RowId == result.RowId));
-            if (rowListIndex >= 0)
-                selectedClientStructsPreviewRow = rowListIndex;
-        }
-
-        if (snapshot != null && result.ColumnIndex >= 0 && snapshot.Columns.Count > 0)
-            selectedClientStructsPreviewColumn = Math.Clamp(result.ColumnIndex, 0, snapshot.Columns.Count - 1);
 
         switchToClientStructsCommonView = true;
     }
@@ -2327,6 +2434,8 @@ public class MainWindow : Window, IDisposable
     private void SelectClientStructsSheet(string name)
     {
         selectedClientStructsSheetName = name;
+        pendingSearchSelection = null;
+        clientStructsSheetSnapshot = null;
         clientStructsPreviewStartIndex = 0;
         selectedClientStructsPreviewRow = -1;
         selectedClientStructsPreviewColumn = -1;
@@ -2338,14 +2447,27 @@ public class MainWindow : Window, IDisposable
         if (string.IsNullOrWhiteSpace(selectedClientStructsSheetName))
             return;
 
-        clientStructsSheetSnapshot = clientStructsSheetService.ReadSheet(selectedClientStructsSheetName, new ClientStructsSheetRequest
+        var name = selectedClientStructsSheetName;
+        var request = new ClientStructsSheetRequest
         {
             StartIndex = clientStructsPreviewStartIndex,
             RowCount = clientStructsPreviewRowCount,
             InventoryType = clientStructsInventoryType
-        });
+        };
+        sheetRead.Request(() =>
+        {
+            var snapshot = clientStructsSheetService.ReadSheet(name, request);
+            return (DateTime.UtcNow, snapshot);
+        }, captured => ApplyRuntimeSheet(captured.Snapshot, name, resetSelection, captured.CapturedAtUtc),
+            ex => runtimeReadError = $"Capture failed; retained values are historical: {ex.Message}");
+    }
 
-        clientStructsSheetLastRefresh = DateTime.UtcNow;
+    private void ApplyRuntimeSheet(ClientStructsSheetSnapshot snapshot, string name, bool resetSelection, DateTime capturedAtUtc)
+    {
+        if (selectedClientStructsSheetName != name) return;
+        clientStructsSheetSnapshot = snapshot;
+        runtimeReadError = string.Empty;
+        clientStructsSheetLastRefresh = capturedAtUtc;
         clientStructsPreviewStartIndex = clientStructsSheetSnapshot.StartIndex;
 
         if (clientStructsSheetSnapshot.Rows.Count == 0 || clientStructsSheetSnapshot.Columns.Count == 0)
@@ -2364,6 +2486,13 @@ public class MainWindow : Window, IDisposable
             selectedClientStructsPreviewColumn = 0;
         else
             selectedClientStructsPreviewColumn = Math.Clamp(selectedClientStructsPreviewColumn, 0, clientStructsSheetSnapshot.Columns.Count - 1);
+        if (pendingSearchSelection is { } selection && selection.SheetName == name)
+        {
+            var rowIndex = snapshot.Rows.FindIndex(row => row.RowIndex == selection.RowIndex && (selection.RowId == 0 || row.RowId == selection.RowId));
+            if (rowIndex >= 0) selectedClientStructsPreviewRow = rowIndex;
+            if (selection.ColumnIndex >= 0) selectedClientStructsPreviewColumn = Math.Clamp(selection.ColumnIndex, 0, snapshot.Columns.Count - 1);
+            pendingSearchSelection = null;
+        }
     }
 
     private void DrawClientStructsSheetPreview()
@@ -2374,15 +2503,14 @@ public class MainWindow : Window, IDisposable
             return;
         }
 
-        if (clientStructsAutoRefresh && (clientStructsSheetSnapshot == null || (DateTime.UtcNow - clientStructsSheetLastRefresh).TotalSeconds >= plugin.Configuration.RefreshInterval))
+        if (!sheetRead.IsPending && clientStructsAutoRefresh && (clientStructsSheetSnapshot == null || (DateTime.UtcNow - clientStructsSheetLastRefresh).TotalSeconds >= plugin.Configuration.RefreshInterval))
             RefreshSelectedClientStructsSheet();
 
-        clientStructsSheetSnapshot ??= clientStructsSheetService.ReadSheet(selectedClientStructsSheetName, new ClientStructsSheetRequest
-        {
-            StartIndex = clientStructsPreviewStartIndex,
-            RowCount = clientStructsPreviewRowCount,
-            InventoryType = clientStructsInventoryType
-        });
+        if (clientStructsSheetSnapshot == null && !sheetRead.IsPending) RefreshSelectedClientStructsSheet();
+        if (sheetRead.IsPending) ImGui.TextDisabled("Waiting for Framework capture...");
+        if (!string.IsNullOrEmpty(runtimeReadError)) ImGui.TextWrapped(runtimeReadError);
+        if (clientStructsSheetLastRefresh != DateTime.MinValue)
+            ImGui.TextDisabled($"Captured {clientStructsSheetLastRefresh:HH:mm:ss} UTC ({Math.Max(0, (DateTime.UtcNow - clientStructsSheetLastRefresh).TotalSeconds):F1}s ago)");
 
         var snapshot = clientStructsSheetSnapshot;
         if (snapshot == null)
@@ -3132,7 +3260,7 @@ public class MainWindow : Window, IDisposable
         try
         {
             var frame = plugin.AddonSnapshots.Current;
-            if (frame.FrameNumber == 0 || frame.FrameNumber == lastLoggingFrameNumber)
+            if (!frame.IsCurrent || frame.FrameNumber == 0 || frame.FrameNumber == lastLoggingFrameNumber)
                 return;
 
             lastLoggingFrameNumber = frame.FrameNumber;

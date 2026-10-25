@@ -6,22 +6,16 @@ XA HUD Navigator is a Dalamud plugin for FFXIV that provides a real-time visual 
 
 ## Key Features
 
-- **Addon List** — Shows one Framework-published snapshot of all loaded game addons with node counts, visibility, and ready state
-- **Node Tree Inspector** — Sortable table that preserves each selected addon's native node indices and null gaps while showing type, scaled bounds, text, and event details
-- **Logging Workspace** — Optional logging mode to capture addon appear/close timing plus live `AtkValues` arrays while you interact with in-game UI
-- **Debug Workspace** — Optional debug tab with recursive component-path dumps, unified filtering across node paths, addon lookup instances, `AtkValues`, and runtime struct fields, selected-branch copy helpers, raw node flags/pointers, a generic `AtkUnitBase` snapshot, and resolved addon/agent ClientStruct field tables for the currently selected addon
-- **Lumina Sheets Browser** — Optional sheets workspace with common-sheet shortcuts, all-sheet search, schema-aware column headers, a multi-row grid, row jumping, and copy helpers
-- **CS.Sheets Browser** — ClientStructs-backed runtime workspace with curated game, player, world, instance, zone-init packet, map, quest, inventory, retainer, housing, social, blacklist, market, Free Company, FATE, party, action, target, Eureka, and Bozja views rendered in the same sheet-style grid workflow, plus loaded-row value filtering, replay-cached zone-init correlation, hook-unavailable reporting, map/public-content range inspection, and a 3-character minimum master search for quick runtime research
-- **Interactive Element Detection** — Identifies buttons, checkboxes, sliders, dropdowns, and other interactive component nodes
-- **HUD Overlay** — Transparent fullscreen overlay uses native origins and scaled extents, filters hidden or disappearing nodes, resolves overlap in reverse draw order, and remains aligned from 100% through 200% UI scale
-- **Text Node Display** — Shows text content from AtkTextNode elements for reading addon text
-- **Copy to Clipboard** — Copy addon names or full node dumps for use in automation development
-- **Search & Filter** — Filter the shared addon snapshot by name
-- **Configurable Overlay** — Toggle bounding boxes, node IDs, addon names, and interactive-only mode; the native scan cadence is clamped to safe refresh bounds
-- **Dalamud Interface Scale Support** — Fixed-width inspector panes, sheet grids, and overlay labels follow the current Dalamud interface zoom so the workspace stays usable above or below 100% scale
-- **Fail-Closed Native Inspection** — ClientStruct field reads validate struct ranges, memory pages, pointer arithmetic, CStrings, vectors, and generated type maps while throttling repeated diagnostics
-
-Selected-node runtime research now includes copyable event-manager details, first-level component child-node summaries, and `TreeList` runtime/renderer sections in the right-side `Node Detail` pane. This is intended for Eureka-style addon work where the important interaction state lives inside a component root rather than a simple text node or top-level callback.
+- **Objects and NPCs** — Inspect classifications, IDs, positions, distances, health, casts and statuses, with search, sortable columns, filters, pinned selection, target shortcuts, a local radar and linked Lumina records.
+- **UI Explorer** — Browse supported open shops, selection menus, confirmations and dialogue in readable tables with item IDs, prices, quantities, source fields and expandable raw details.
+- **Inventory** — Inspect all four bags, sorted grid pages, armoury categories, crystals and normal/premium saddlebags, including empty slots, container/slot mapping, readable item names and expanded materia, dye, glamour and crafter details.
+- **Character** — View all 13 active equipment slots, item condition and attributes, current/max resources, item level, character stats and clearly labeled profile fields.
+- **Addon and Node Inspector** — Search loaded addons and browse sortable node trees with native indices, text, bounds, interactive controls, events, component children, TreeList details and texture metadata.
+- **HUD Overlay** — Highlight addons and nodes with configurable bounds, IDs, names and interactive-only filtering; overlay alignment follows game UI scale, while inspector panes and labels follow Dalamud zoom.
+- **Debugging and Logging** — Capture addon open/close timing, inspect AtkValues and addon/agent ClientStructs fields, and filter or copy recursive node paths and runtime dumps.
+- **Lumina Sheets** — Search game-data sheets with schema-aware columns, row navigation, paging, raw/formatted values and copy helpers.
+- **CS.Sheets** — Explore ClientStructs-backed player, world, instance, map, quest, social, market and foray data with paging, row filtering and master search across runtime views.
+- **Capture and Export** — Objects and UI Explorer each default to stopped, with explicit Start/Stop controls and capture stopping on window close. Retain historical snapshots, copy inspection data and save object/menu JSON.
 
 | Command          | Description                             |
 | ---------------- | --------------------------------------- |
@@ -74,8 +68,8 @@ This will likely have game crashes caused by reading too much memory directly fr
 8. In **Lumina Sheets**, use **Schema Formatting**, **Offsets**, and **Comments** to switch between raw columns and EXDSchema-style field formatting
 9. In **CS.Sheets**, pick a curated runtime view such as `Conditions`, `Weather`, `Public Instance`, `Network Instance`, `Zone Init Packet`, `Contents Finder`, `EventFramework`, `Content Director`, `Dynamic Events`, `Eureka Status`, `Bozja Status`, `Agent Map`, `Map Markers`, `FATE Summary`, `Active FATEs`, `Party Members`, `Inventory Slots`, `Retainers`, `Blacklist`, `Linkshell`, `Cross-world Linkshell`, `Housing`, `Item Search Listings`, or `TargetSystem`
 10. For shard and instance research, compare `Public Instance`, `Network Instance`, `Zone Init Packet`, `Eureka Status`, and `Agent Map` together; those views now surface preferred instance candidates, live/replay `ServerId`, replay-cached zone-init values, hook status or unavailable reason, territory filter keys, map marker ranges, and public-content pop-range fields
-11. In **CS.Sheets**, compare `Party Members` and `Blacklist` to cross-reference `PartyMember.AccountId` against `InfoProxyBlacklist` results
-12. Use the **Master Search** tab inside **CS.Sheets** to search across all runtime views at once; queries shorter than 3 characters are ignored to reduce noise, and matching results can be opened directly in the runtime preview
+11. In **CS.Sheets**, compare `FATE Summary` and `Active FATEs` to inspect your current FATE state alongside individual FATE details
+12. Use the **Master Search** tab inside **CS.Sheets** to search across all runtime views at once; queries shorter than 3 characters are ignored to reduce noise, and matching results can be opened directly in the runtime preview. Search reads other views before filtering, so a Free Company query also inspects map/event data. Invalid Event Marker storage is skipped, invalid tooltip text is shown as unavailable, and short final pages preserve forward search progress.
 13. For runtime views that support it, use **InventoryType**, **Start Index**, **Rows**, the paging buttons, and the loaded-row filter to browse and search live containers and caches in a sheet-style grid
 14. Click any grid cell to inspect the selected row, raw/display values, field details, and copy helpers on the right
 15. Click any addon in the left panel to inspect its node tree and debug dump

@@ -21,7 +21,7 @@ public sealed class AddonSnapshotService : IDisposable
             configuration,
             SubscribeFramework,
             () => DateTime.UtcNow,
-            AddonInspector.ScanAllAddons,
+            AddonInspector.CaptureAllAddons,
             AddonInspector.ScanSingleAddon,
             AddonInspector.BuildNodeRuntimeReport)
     {
@@ -121,7 +121,7 @@ public sealed class AddonSnapshotService : IDisposable
         }
         catch (Exception ex)
         {
-            state.Fail(request);
+            state.Fail(request, $"{ex.GetType().Name}: {ex.Message}");
             DiagnosticLog.VerboseThrottled("AddonSnapshotService.Update", ex);
         }
     }
@@ -219,7 +219,11 @@ internal sealed class AddonSnapshotState
                     request.CapturedAtUtc,
                     addons,
                     selectedAddon,
-                    selectedNodeRuntime);
+                    selectedNodeRuntime)
+                {
+                    CaptureStatus = AddonSnapshotCaptureStatus.Captured,
+                    LastAttemptUtc = request.CapturedAtUtc,
+                };
                 Volatile.Write(ref current, next);
             }
 
@@ -227,10 +231,23 @@ internal sealed class AddonSnapshotState
         }
     }
 
-    internal void Fail(AddonRefreshRequest request)
+    internal void Fail(AddonRefreshRequest request, string error = "The addon snapshot could not be captured.")
     {
         lock (gate)
+        {
+            if (refreshGeneration == request.RefreshGeneration)
+            {
+                // Retain the last successful values for inspection without presenting them as a new capture.
+                Volatile.Write(ref current, current with
+                {
+                    CaptureStatus = AddonSnapshotCaptureStatus.Failed,
+                    LastAttemptUtc = request.CapturedAtUtc,
+                    Error = error,
+                });
+                Volatile.Write(ref hoveredNodeIndex, -1);
+            }
             FinishRefresh(request);
+        }
     }
 
     private void FinishRefresh(AddonRefreshRequest request)
@@ -253,10 +270,22 @@ public sealed record AddonFrameSnapshot(
     AddonInfo? SelectedAddon,
     NodeRuntimeReport? SelectedNodeRuntime)
 {
+    public AddonSnapshotCaptureStatus CaptureStatus { get; init; }
+    public DateTime LastAttemptUtc { get; init; } = DateTime.MinValue;
+    public string Error { get; init; } = string.Empty;
+    public bool IsCurrent => CaptureStatus == AddonSnapshotCaptureStatus.Captured;
+
     public static AddonFrameSnapshot Empty { get; } = new(
         0,
         DateTime.MinValue,
         Array.Empty<AddonInfo>(),
         null,
         null);
+}
+
+public enum AddonSnapshotCaptureStatus
+{
+    NotCaptured,
+    Captured,
+    Failed,
 }

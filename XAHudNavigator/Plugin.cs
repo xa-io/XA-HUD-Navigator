@@ -20,11 +20,15 @@ public sealed class Plugin : IDalamudPlugin
     [PluginService] public static IGameInteropProvider HookProvider { get; private set; } = null!;
     [PluginService] public static IFramework Framework { get; private set; } = null!;
     [PluginService] public static IPluginLog Log { get; private set; } = null!;
+    [PluginService] public static IObjectTable ObjectTable { get; private set; } = null!;
+    [PluginService] public static ITargetManager TargetManager { get; private set; } = null!;
 
     private const string CommandName = "/xahud";
 
     public Configuration Configuration { get; init; }
     public AddonSnapshotService AddonSnapshots { get; }
+    internal WorldObjectSnapshotService ObjectSnapshots { get; }
+    internal UiMenuSnapshotService MenuSnapshots { get; }
 
     public WindowSystem WindowSystem { get; } = new("XAHudNavigator");
     private MainWindow MainWindow { get; init; }
@@ -35,6 +39,8 @@ public sealed class Plugin : IDalamudPlugin
     {
         Configuration = LoadConfiguration();
         AddonSnapshots = new AddonSnapshotService(Configuration);
+        ObjectSnapshots = new WorldObjectSnapshotService(Configuration);
+        MenuSnapshots = new UiMenuSnapshotService(Configuration);
 
         MainWindow = new MainWindow(this);
         HudOverlay = new HudOverlay(this);
@@ -72,6 +78,8 @@ public sealed class Plugin : IDalamudPlugin
         TryCleanup("MainWindow.Dispose", MainWindow.Dispose);
         TryCleanup("HudOverlay.Dispose", HudOverlay.Dispose);
         TryCleanup("AddonSnapshots.Dispose", AddonSnapshots.Dispose);
+        TryCleanup("ObjectSnapshots.Dispose", ObjectSnapshots.Dispose);
+        TryCleanup("MenuSnapshots.Dispose", MenuSnapshots.Dispose);
     }
 
     private static Configuration LoadConfiguration()
@@ -123,5 +131,5 @@ public sealed class Plugin : IDalamudPlugin
 
 internal static class BuildInfo
 {
-    public const string Version = "0.0.0.10";
+    public const string Version = "0.0.0.11";
 }

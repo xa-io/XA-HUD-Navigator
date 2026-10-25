@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System.Text;
 using FFXIVClientStructs.Attributes;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
@@ -21,6 +23,7 @@ public sealed class ResolvedNativeStructSnapshot
     public int Size { get; set; }
     public bool IsResolved { get; set; }
     public string ResolutionInfo { get; set; } = "";
+    public bool IsTruncated { get; set; }
     public List<ResolvedNativeFieldInfo> Fields { get; set; } = new();
 }
 
@@ -41,8 +44,15 @@ public static partial class ClientStructRuntimeInspector
     private const uint PageNoAccess = 0x01;
     private const uint PageGuard = 0x100;
     internal const long MaxVectorElements = 1_000_000;
+    internal const int MaxInspectionFields = 512;
+    internal const int MaxInlineDepth = 4;
+    internal const int MaxInlineArrayElements = 32;
 
     private static readonly StringComparer NameComparer = StringComparer.OrdinalIgnoreCase;
+    private static readonly ConcurrentDictionary<Type, NativeTypeLayout> FieldLayouts = new();
+    private static readonly ConcurrentDictionary<Type, int> StructSizes = new();
+    private static readonly MethodInfo ReferenceFreeSizeMethod = typeof(ClientStructRuntimeInspector)
+        .GetMethod(nameof(GetReferenceFreeSize), BindingFlags.Static | BindingFlags.NonPublic)!;
     private static readonly Lazy<ClientStructTypeMaps> StructTypeMaps = new(BuildStructTypeMaps);
     private static readonly AgentId[] AgentIds = Enum.GetValues<AgentId>().Distinct().ToArray();
 
@@ -182,7 +192,14 @@ public static partial class ClientStructRuntimeInspector
             return;
         }
 
-        snapshot.Fields = ReadFields(structType, snapshot.Address, snapshot.Size);
+        var fields = new List<ResolvedNativeFieldInfo>();
+        var truncated = false;
+        ReadFields(structType, snapshot.Address, snapshot.Size, 0, string.Empty, 0, fields, ref truncated);
+        snapshot.Fields = fields;
+        snapshot.IsTruncated = truncated;
+        snapshot.ResolutionInfo += $" Inline inspection: depth {MaxInlineDepth}, {MaxInlineArrayElements} elements per array, {MaxInspectionFields} fields maximum; arbitrary pointers are not followed.";
+        if (truncated)
+            snapshot.ResolutionInfo += " Some inline fields were omitted at an inspection limit.";
     }
 
     private static ClientStructTypeMaps BuildStructTypeMaps()
@@ -256,39 +273,31 @@ public static partial class ClientStructRuntimeInspector
         return null;
     }
 
-    private static List<ResolvedNativeFieldInfo> ReadFields(Type structType, nint baseAddress, int structSize)
+    private static void ReadFields(Type structType, nint baseAddress, int structSize, int rootOffset,
+        string prefix, int depth, List<ResolvedNativeFieldInfo> results, ref bool truncated)
     {
-        var fields = structType
-            .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-            .Select(field => new
-            {
-                Field = field,
-                Offset = field.GetCustomAttribute<FieldOffsetAttribute>()?.Value
-            })
-            .Where(x => x.Offset.HasValue)
-            .OrderBy(x => x.Offset!.Value)
-            .ThenBy(x => x.Field.Name, StringComparer.Ordinal)
-            .ToList();
-
-        var results = new List<ResolvedNativeFieldInfo>(fields.Count);
-        foreach (var entry in fields)
+        var layout = FieldLayouts.GetOrAdd(structType, BuildFieldLayout);
+        foreach (var entry in layout.Fields)
         {
-            var offset = entry.Offset!.Value;
+            if (results.Count >= MaxInspectionFields)
+            {
+                truncated = true;
+                return;
+            }
+
+            var offset = entry.Offset;
             var field = entry.Field;
             var hasAddress = TryAddAddress(baseAddress, offset, out var fieldAddress);
             var fieldInfo = new ResolvedNativeFieldInfo
             {
-                Offset = offset,
-                Name = field.Name,
+                Offset = rootOffset + offset,
+                Name = prefix + field.Name,
                 TypeName = FormatTypeName(field.FieldType),
                 Address = hasAddress ? fieldAddress : 0,
             };
 
-            var notes = BuildFieldNotes(field, structSize, offset);
-            var readSize = GetDirectReadSize(field.FieldType);
-            var withinStruct = offset >= 0
-                               && (structSize <= 0
-                                   || (readSize > 0 ? offset <= structSize - readSize : offset < structSize));
+            var notes = entry.Notes;
+            var withinStruct = IsFieldWithinBounds(offset, entry.StorageSize, structSize);
             if (!hasAddress)
             {
                 fieldInfo.Value = "<unreadable>";
@@ -299,33 +308,174 @@ public static partial class ClientStructRuntimeInspector
                 fieldInfo.Value = "<unreadable>";
                 fieldInfo.Notes = JoinNotes(notes, "field range exceeds reported struct size");
             }
-            else if (TryReadFieldValue(fieldInfo.Address, field.FieldType, out var value, out var readNotes))
+            else if (entry.StorageSize > 0 && !IsReadableRange(fieldAddress, (nuint)entry.StorageSize))
             {
-                fieldInfo.IsReadable = true;
-                fieldInfo.Value = value;
-                fieldInfo.Notes = JoinNotes(notes, readNotes);
+                fieldInfo.Value = "<unreadable>";
+                fieldInfo.Notes = JoinNotes(notes, $"native range is not readable ({entry.StorageSize} bytes)");
             }
             else
             {
+                var readable = TryReadFieldValue(fieldInfo.Address, field.FieldType, out var value, out var readNotes);
+                fieldInfo.IsReadable = readable;
                 fieldInfo.Value = value;
                 fieldInfo.Notes = JoinNotes(notes, readNotes);
+
+                if (entry.ArrayElementType != null || (!readable && CanExpandInline(field.FieldType)))
+                {
+                    fieldInfo.IsReadable = entry.StorageSize > 0;
+                    fieldInfo.Value = entry.ArrayElementType == null
+                        ? $"<{FormatTypeName(field.FieldType)} inline>"
+                        : $"<{FormatTypeName(entry.ArrayElementType)}[{entry.ArrayLength}] inline>";
+                    results.Add(fieldInfo);
+                    if (depth >= MaxInlineDepth)
+                    {
+                        fieldInfo.Notes = JoinNotes(notes, "inline depth limit reached");
+                        truncated = true;
+                    }
+                    else if (entry.ArrayElementType != null)
+                    {
+                        ReadInlineArray(entry, fieldInfo, depth + 1, results, ref truncated);
+                    }
+                    else
+                    {
+                        var before = results.Count;
+                        ReadFields(field.FieldType, fieldAddress, entry.StorageSize, fieldInfo.Offset,
+                            fieldInfo.Name + ".", depth + 1, results, ref truncated);
+                        fieldInfo.Notes = JoinNotes(notes, before == results.Count ? "inline layout has no supported field offsets" : "inline fields expanded below");
+                    }
+                    continue;
+                }
             }
             results.Add(fieldInfo);
         }
-
-        return results;
     }
 
-    private static string BuildFieldNotes(FieldInfo field, int structSize, int offset)
+    private static void ReadInlineArray(NativeFieldLayout entry, ResolvedNativeFieldInfo parent, int depth,
+        List<ResolvedNativeFieldInfo> results, ref bool truncated)
     {
-        var notes = new List<string>();
-        if (structSize > 0 && offset >= structSize)
-            notes.Add($"offset exceeds reported size 0x{structSize:X}");
+        parent.Notes = JoinNotes(entry.Notes, "inline elements expanded below");
+        var elementType = entry.ArrayElementType!;
+        var stride = GetNativeStorageSize(elementType);
+        if (stride <= 0 || entry.ArrayLength <= 0 || (long)stride * entry.ArrayLength > entry.StorageSize)
+        {
+            parent.Notes = JoinNotes(parent.Notes, "array element layout is unavailable or exceeds its field");
+            return;
+        }
 
-        if (field.CustomAttributes.Any(attr => attr.AttributeType.Name.Contains("FixedSizeArray", StringComparison.Ordinal)))
-            notes.Add("fixed-size array");
+        var count = Math.Min(entry.ArrayLength, MaxInlineArrayElements);
+        for (var i = 0; i < count; i++)
+        {
+            if (results.Count >= MaxInspectionFields)
+            {
+                truncated = true;
+                break;
+            }
+            var offset = i * stride;
+            if (!TryAddAddress(parent.Address, offset, out var address))
+                break;
+            var item = new ResolvedNativeFieldInfo
+            {
+                Offset = parent.Offset + offset,
+                Name = $"{parent.Name}[{i}]",
+                TypeName = FormatTypeName(elementType),
+                Address = address,
+            };
+            item.IsReadable = TryReadFieldValue(address, elementType, out var value, out var notes);
+            item.Value = value;
+            item.Notes = notes;
+            results.Add(item);
+            if (!item.IsReadable && CanExpandInline(elementType) && IsReadableRange(address, (nuint)stride))
+            {
+                item.IsReadable = true;
+                item.Value = $"<{FormatTypeName(elementType)} inline>";
+                if (depth >= MaxInlineDepth)
+                {
+                    item.Notes = "inline depth limit reached";
+                    truncated = true;
+                }
+                else
+                {
+                    ReadFields(elementType, address, stride, item.Offset, item.Name + ".", depth + 1, results, ref truncated);
+                }
+            }
+        }
+        if (entry.ArrayLength > count)
+        {
+            parent.Notes = JoinNotes(parent.Notes, $"array preview limited to first {count} of {entry.ArrayLength} elements");
+            truncated = true;
+        }
+    }
 
-        return string.Join("; ", notes);
+    internal static bool IsFieldWithinBounds(int offset, int fieldSize, int ownerSize)
+        => offset >= 0 && ownerSize > 0 && fieldSize > 0 && fieldSize <= ownerSize && offset <= ownerSize - fieldSize;
+
+    private static bool CanExpandInline(Type type)
+        => type.IsValueType && !type.IsPrimitive && !type.IsEnum && GetDirectReadSize(type) == 0;
+
+    private static NativeTypeLayout BuildFieldLayout(Type type)
+    {
+        var fields = new List<NativeFieldLayout>();
+        foreach (var field in type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+        {
+            var offset = field.GetCustomAttribute<FieldOffsetAttribute>()?.Value;
+            // Marshal offsets are safe for blittable sequential layouts, but bool/char marshaling
+            // can change the actual inline CLR layout. Leave those unsupported rather than guess.
+            if (!offset.HasValue && type.IsLayoutSequential && IsBlittableLayout(type, 0))
+            {
+                try { offset = checked((int)Marshal.OffsetOf(type, field.Name)); }
+                catch (Exception) { }
+            }
+            if (!offset.HasValue)
+                continue;
+            var fixedBuffer = field.GetCustomAttribute<FixedBufferAttribute>();
+            var element = fixedBuffer?.ElementType;
+            var count = fixedBuffer?.Length ?? 0;
+            if (element == null && TryGetInlineArray(field.FieldType, out var inlineElement, out var inlineCount))
+            {
+                element = inlineElement;
+                count = inlineCount;
+            }
+            var size = element == null ? GetNativeStorageSize(field.FieldType) : GetArrayStorageSize(element, count);
+            var notes = element == null ? string.Empty : $"fixed-size inline array ({count} elements)";
+            fields.Add(new NativeFieldLayout(field, offset.Value, size, element, count, notes));
+        }
+        return new NativeTypeLayout(fields.OrderBy(field => field.Offset).ThenBy(field => field.Field.Name, StringComparer.Ordinal).ToArray());
+    }
+
+    private static bool IsBlittableLayout(Type type, int depth)
+    {
+        if (depth > 8 || type == typeof(bool) || type == typeof(char))
+            return false;
+        if (type.IsPointer || type.IsFunctionPointer || type.IsEnum || type.IsPrimitive || type == typeof(nint) || type == typeof(nuint))
+            return true;
+        return type.IsValueType && (type.IsExplicitLayout || type.IsLayoutSequential)
+            && type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                .All(field => IsBlittableLayout(field.FieldType, depth + 1));
+    }
+
+    private static bool TryGetInlineArray(Type type, out Type? elementType, out int count)
+    {
+        elementType = null;
+        count = type.GetCustomAttribute<InlineArrayAttribute>()?.Length ?? 0;
+        if (count <= 0)
+            return false;
+        var fields = type.GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        if (fields.Length != 1)
+            return false;
+        elementType = fields[0].FieldType;
+        return true;
+    }
+
+    private static int GetArrayStorageSize(Type elementType, int count)
+    {
+        var stride = GetNativeStorageSize(elementType);
+        return stride > 0 && count > 0 && count <= int.MaxValue / stride ? stride * count : 0;
+    }
+
+    private static int GetNativeStorageSize(Type type)
+    {
+        var direct = GetDirectReadSize(type);
+        return direct > 0 ? direct : type.IsValueType ? TryGetStructSize(type) : 0;
     }
 
     private static string JoinNotes(string first, string second)
@@ -382,7 +532,7 @@ public static partial class ClientStructRuntimeInspector
             if (IsCStringPointerType(fieldType))
                 return TryReadCStringPointerValue(address, out value, out notes);
 
-            if (fieldType.IsPointer || fieldType == typeof(IntPtr) || fieldType == typeof(UIntPtr) || IsClientStructPointer(fieldType))
+            if (fieldType.IsPointer || fieldType.IsFunctionPointer || fieldType == typeof(IntPtr) || fieldType == typeof(UIntPtr) || IsClientStructPointer(fieldType))
             {
                 var pointerValue = Marshal.ReadIntPtr(address);
                 value = $"0x{pointerValue.ToInt64():X}";
@@ -666,20 +816,7 @@ public static partial class ClientStructRuntimeInspector
     }
 
     private static int GetElementStride(Type elementType)
-    {
-        if (elementType.IsPointer || elementType == typeof(IntPtr) || elementType == typeof(UIntPtr))
-            return IntPtr.Size;
-
-        try
-        {
-            return Marshal.SizeOf(elementType);
-        }
-        catch (Exception ex)
-        {
-            DiagnosticLog.VerboseThrottled("ClientStructRuntimeInspector.GetElementStride", ex);
-            return 0;
-        }
-    }
+        => GetNativeStorageSize(elementType);
 
     internal static bool TryValidateVectorHeader(
         nint first,
@@ -840,7 +977,7 @@ public static partial class ClientStructRuntimeInspector
         if (fieldType.IsEnum)
             return GetDirectReadSize(fieldType.GetEnumUnderlyingType());
 
-        if (fieldType.IsPointer
+        if (fieldType.IsPointer || fieldType.IsFunctionPointer
             || fieldType == typeof(IntPtr)
             || fieldType == typeof(UIntPtr)
             || IsClientStructPointer(fieldType)
@@ -943,10 +1080,19 @@ public static partial class ClientStructRuntimeInspector
     }
 
     private static int TryGetStructSize(Type structType)
+        => StructSizes.GetOrAdd(structType, CalculateStructSize);
+
+    private static int CalculateStructSize(Type structType)
     {
+        if (structType == typeof(void) || !structType.IsValueType || structType.ContainsGenericParameters || structType.IsByRefLike
+            || (!structType.IsExplicitLayout && !structType.IsLayoutSequential))
+            return 0;
+
         try
         {
-            return Marshal.SizeOf(structType);
+            // Native memory uses the actual CLR storage layout, including generic padding and inline arrays.
+            // Marshal.SizeOf(Type) rejects closed generics and can enlarge bool/char fields for marshaling.
+            return (int)ReferenceFreeSizeMethod.MakeGenericMethod(structType).Invoke(null, null)!;
         }
         catch (Exception ex)
         {
@@ -954,6 +1100,9 @@ public static partial class ClientStructRuntimeInspector
             return 0;
         }
     }
+
+    private static int GetReferenceFreeSize<T>()
+        => RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? 0 : Unsafe.SizeOf<T>();
 
     internal static string FormatTypeName(Type type)
     {
@@ -995,4 +1144,8 @@ public static partial class ClientStructRuntimeInspector
     private sealed record ClientStructTypeMaps(
         Dictionary<string, Type> Addons,
         Dictionary<AgentId, Type> Agents);
+
+    private sealed record NativeTypeLayout(NativeFieldLayout[] Fields);
+    private sealed record NativeFieldLayout(FieldInfo Field, int Offset, int StorageSize,
+        Type? ArrayElementType, int ArrayLength, string Notes);
 }

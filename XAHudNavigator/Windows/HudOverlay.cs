@@ -57,7 +57,9 @@ public sealed class HudOverlay : Window, IDisposable
     {
         if (!plugin.Configuration.OverlayEnabled) return;
 
-        var selectedAddon = plugin.AddonSnapshots.Current.SelectedAddon;
+        var frame = plugin.AddonSnapshots.Current;
+        if (!frame.IsCurrent) return;
+        var selectedAddon = frame.SelectedAddon;
 
         if (selectedAddon == null
             || !selectedAddon.IsVisible

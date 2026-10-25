@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -17,6 +18,7 @@ using FFXIVClientStructs.FFXIV.Client.System.String;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Info;
+using FFXIVClientStructs.STD;
 using InteropGenerator.Runtime;
 using Lumina.Excel.Sheets;
 using AgentContentsType = FFXIVClientStructs.FFXIV.Client.UI.Agent.ContentsType;
@@ -146,49 +148,130 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
 
     public List<ClientStructsSearchResult> SearchAllSheets(string filter, ClientStructsSheetRequest request, int maxResults = 300)
     {
-        var trimmedFilter = filter?.Trim() ?? string.Empty;
-        if (trimmedFilter.Length < 3)
-            return new List<ClientStructsSearchResult>();
-
         var results = new List<ClientStructsSearchResult>();
-        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
-        var rowCount = Math.Clamp(request.RowCount <= 0 ? 100 : request.RowCount, 5, 100);
+        using var search = StartSearch(filter, request, maxResults);
+        while (search.MoveNext())
+            results = search.Current.Results;
+        return results;
+    }
 
-        foreach (var definition in SheetDefinitions)
+    // Creation is metadata-only. The owning Framework callback advances this once per tick;
+    // Draw consumes progress snapshots and never needs to read native state for a search.
+    public IEnumerator<ClientStructsSearchProgress> StartSearch(string filter, ClientStructsSheetRequest request, int maxResults = 300)
+        => CreateSearch(SheetDefinitions, ReadSheet, filter, request, maxResults);
+
+    internal const int MaxSearchPages = 256;
+    internal const int MaxSearchResults = 300;
+
+    internal static IEnumerator<ClientStructsSearchProgress> CreateSearch(
+        IReadOnlyList<ClientStructsSheetDefinition> definitions,
+        Func<string, ClientStructsSheetRequest, ClientStructsSheetSnapshot> readSheet,
+        string filter, ClientStructsSheetRequest request, int maxResults = MaxSearchResults)
+        => new SearchSession(definitions, readSheet, filter, request, maxResults);
+
+    private sealed class SearchSession : IEnumerator<ClientStructsSearchProgress>
+    {
+        private readonly ClientStructsSheetDefinition[] definitions;
+        private readonly Func<string, ClientStructsSheetRequest, ClientStructsSheetSnapshot> readSheet;
+        private readonly string filter;
+        private readonly int rowCount;
+        private readonly InventoryType inventoryType;
+        private readonly int maxResults;
+        private readonly List<ClientStructsSearchResult> results = new();
+        private readonly HashSet<string> seenKeys = new(StringComparer.Ordinal);
+        private int definitionIndex;
+        private int startIndex;
+        private int pagesRead;
+        private bool finished;
+
+        public SearchSession(IReadOnlyList<ClientStructsSheetDefinition> definitions,
+            Func<string, ClientStructsSheetRequest, ClientStructsSheetSnapshot> readSheet,
+            string filter, ClientStructsSheetRequest request, int maxResults)
         {
-            AddDefinitionSearchMatches(definition, trimmedFilter, results, seenKeys, maxResults);
-            if (results.Count >= maxResults)
-                break;
+            this.definitions = definitions.ToArray();
+            this.readSheet = readSheet;
+            this.filter = filter?.Trim() ?? string.Empty;
+            rowCount = Math.Clamp(request.RowCount <= 0 ? 100 : request.RowCount, 5, 100);
+            inventoryType = request.InventoryType;
+            this.maxResults = Math.Clamp(maxResults, 0, MaxSearchResults);
+        }
 
-            var startIndex = 0;
-            while (true)
+        public ClientStructsSearchProgress Current { get; private set; } = new(new(), false, 0, "Search pending");
+        object IEnumerator.Current => Current;
+
+        public bool MoveNext()
+        {
+            if (finished)
+                return false;
+            if (filter.Length < 3)
+                return Publish(true, "Enter at least 3 characters to search.");
+            if (maxResults == 0 || definitions.Length == 0)
+                return Publish(true, "No views or result slots to search.");
+
+            var definition = definitions[definitionIndex];
+            if (startIndex == 0)
+                AddDefinitionSearchMatches(definition, filter, results, seenKeys, maxResults);
+            if (results.Count >= maxResults)
+                return Publish(true, $"Search stopped at the {maxResults}-result limit.", true);
+
+            ClientStructsSheetSnapshot snapshot;
+            try
             {
-                var snapshot = ReadSheet(definition.Name, new ClientStructsSheetRequest
+                pagesRead++;
+                snapshot = readSheet(definition.Name, new ClientStructsSheetRequest
                 {
                     StartIndex = startIndex,
                     RowCount = definition.SupportsWindowing ? 100 : rowCount,
-                    InventoryType = request.InventoryType
+                    InventoryType = inventoryType,
                 });
-
-                AddSnapshotSearchMatches(snapshot, trimmedFilter, results, seenKeys, maxResults);
-                if (results.Count >= maxResults || !definition.SupportsWindowing)
-                    break;
-
-                if (snapshot.Rows.Count == 0)
-                    break;
-
-                var nextStartIndex = snapshot.StartIndex + snapshot.Rows.Count;
-                if (nextStartIndex >= snapshot.TotalRowCount)
-                    break;
-
-                startIndex = nextStartIndex;
+            }
+            catch (Exception ex)
+            {
+                return Publish(true, $"Search stopped while reading {definition.Name}: {ex.GetType().Name}: {ex.Message}", true);
             }
 
+            AddSnapshotSearchMatches(snapshot, filter, results, seenKeys, maxResults);
             if (results.Count >= maxResults)
-                break;
+                return Publish(true, $"Search stopped at the {maxResults}-result limit.", true);
+
+            if (definition.SupportsWindowing && snapshot.TotalRowCount > startIndex)
+            {
+                var nextIndex = (long)snapshot.StartIndex + snapshot.Rows.Count;
+                if (snapshot.StartIndex != startIndex || snapshot.Rows.Count == 0
+                    || nextIndex <= startIndex || nextIndex > int.MaxValue)
+                    return Publish(true, $"Search stopped: {definition.Name} pagination changed or did not advance at row {startIndex}.", true);
+                if (nextIndex < snapshot.TotalRowCount)
+                    startIndex = (int)nextIndex;
+                else
+                    AdvanceView();
+            }
+            else
+            {
+                AdvanceView();
+            }
+
+            if (definitionIndex >= definitions.Length)
+                return Publish(true, $"Search complete: {pagesRead} pages, {results.Count} matches.");
+            if (pagesRead >= MaxSearchPages)
+                return Publish(true, $"Search stopped at the {MaxSearchPages}-page limit.", true);
+            return Publish(false, $"Searched {definition.Name}; {pagesRead} pages, {results.Count} matches.");
         }
 
-        return results;
+        private void AdvanceView()
+        {
+            definitionIndex++;
+            startIndex = 0;
+        }
+
+        private bool Publish(bool complete, string status, bool truncated = false)
+        {
+            Current = new ClientStructsSearchProgress(new List<ClientStructsSearchResult>(results), complete, pagesRead, status, truncated);
+            finished = complete;
+            return true;
+        }
+
+        public void Dispose() => finished = true;
+        public void Reset() => throw new NotSupportedException("Start a new search instead of resetting a live snapshot search.");
     }
 
     private static void AddDefinitionSearchMatches(ClientStructsSheetDefinition definition, string filter, List<ClientStructsSearchResult> results, HashSet<string> seenKeys, int maxResults)
@@ -459,13 +542,13 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         var networkCurrentInstance = networkModule == null ? (short)0 : networkModule->CurrentInstance;
         var gameMain = GameMain.Instance();
         var zoneInit = zoneInstanceSnapshotService.GetSnapshot();
-        var replayManager = ContentsReplayManager.Instance();
+        var replayManager = TryGetReplayManager();
         var hasReplayZoneInit = replayManager != null && replayManager->ZoneInitPacket.TerritoryTypeId != 0;
         var agentMap = TryGetAgentMap();
         var eventFramework = EventFramework.Instance();
         var publicContentDirector = eventFramework == null ? null : eventFramework->GetPublicContentDirector();
         var preferredInstanceCandidate = ResolvePreferredInstanceCandidate(
-            publicInstance->InstanceId,
+            publicInstance->TerritoryTypeId == Plugin.ClientState.TerritoryType ? publicInstance->InstanceId : 0u,
             proxyCurrentInstance,
             networkCurrentInstance,
             Plugin.ClientState.Instance,
@@ -487,20 +570,22 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("CloseCountdown", publicInstance->CloseCountdown.ToString("F1", CultureInfo.InvariantCulture), publicInstance->CloseCountdown, "Countdown while the public-instance selection window is open"),
                 SummaryRow("TerritoryTypeId", ResolveTerritoryName(publicInstance->TerritoryTypeId), publicInstance->TerritoryTypeId, "Territory associated with the current public-instance state"),
                 SummaryRow("InstanceId", publicInstance->InstanceId, publicInstance->InstanceId, "Public-instance id currently exposed by UIState"),
-                SummaryRow("PreferredInstanceCandidate", preferredInstanceCandidate == 0 ? "<none>" : preferredInstanceCandidate, preferredInstanceCandidate, "First non-zero candidate from UIState.PublicInstance.InstanceId -> NetworkModuleProxy.GetCurrentInstance() -> NetworkModule.CurrentInstance -> Dalamud.ClientState.Instance -> LastZoneInit.PacketInstance -> ReplayZoneInit.Instance"),
+                SummaryRow("PreferredInstanceCandidate", preferredInstanceCandidate == 0 ? "<none>" : preferredInstanceCandidate, preferredInstanceCandidate, "First non-zero eligible candidate; historical packets/replay are excluded. Order: UIState.PublicInstance.InstanceId -> NetworkModuleProxy.GetCurrentInstance() -> NetworkModule.CurrentInstance -> Dalamud.ClientState.Instance -> LastZoneInit.PacketInstance -> ReplayZoneInit.Instance"),
                 SummaryRow("PreferredInstanceSource", preferredInstanceSource, preferredInstanceSource, "Source currently supplying PreferredInstanceCandidate"),
-                SummaryRow("PreferredServerIdCandidate", preferredServerIdCandidate == 0 ? "<none>" : preferredServerIdCandidate, preferredServerIdCandidate, "First non-zero server-id candidate from LastZoneInit.ServerId -> ReplayZoneInit.ServerId"),
+                SummaryRow("PreferredServerIdCandidate", preferredServerIdCandidate == 0 ? "<none>" : preferredServerIdCandidate, preferredServerIdCandidate, "First non-zero fresh, corroborated server-id candidate from LastZoneInit.ServerId -> ReplayZoneInit.ServerId"),
                 SummaryRow("PreferredServerIdSource", preferredServerIdSource, preferredServerIdSource, "Source currently supplying PreferredServerIdCandidate"),
-                SummaryRow("PreferredPopRangeCandidate", preferredPopRangeCandidate == 0 ? "<none>" : preferredPopRangeCandidate, preferredPopRangeCandidate, "First non-zero layout/pop-range candidate from LastZoneInit.PopRangeId -> ReplayZoneInit.PopRangeId -> PublicContent.LGBPopRange"),
+                SummaryRow("PreferredPopRangeCandidate", preferredPopRangeCandidate == 0 ? "<none>" : preferredPopRangeCandidate, preferredPopRangeCandidate, "First non-zero eligible layout/pop-range candidate; historical packet/replay values are excluded. Order: LastZoneInit.PopRangeId -> ReplayZoneInit.PopRangeId -> PublicContent.LGBPopRange"),
                 SummaryRow("PreferredPopRangeSource", preferredPopRangeSource, preferredPopRangeSource, "Source currently supplying PreferredPopRangeCandidate"),
                 SummaryRow("NetworkModuleProxy.GetCurrentInstance()", proxyCurrentInstance, proxyCurrentInstance, "Current instance returned by NetworkModuleProxy"),
                 SummaryRow("NetworkModule.CurrentInstance", networkCurrentInstance, networkCurrentInstance, "Backing short field stored in NetworkModule"),
                 SummaryRow("Dalamud.ClientState.Instance", Plugin.ClientState.Instance, Plugin.ClientState.Instance, "Dalamud client-state instance maintained from NetworkModuleProxy.SetCurrentInstance"),
+                SummaryRow("LastZoneInit.Freshness", zoneInit.Freshness, zoneInit.Freshness, "Historical packet fields remain visible; only a packet from the current session and zone generation can supply a preferred candidate"),
+                SummaryRow("ReplayZoneInit.IsCurrentContext", hasReplayZoneInit && ZoneInstanceSnapshotService.IsReplayCurrent(zoneInit, replayManager->ZoneInitPacket), hasReplayZoneInit && ZoneInstanceSnapshotService.IsReplayCurrent(zoneInit, replayManager->ZoneInitPacket), "Replay cache must match a fresh captured packet; cached territory alone does not establish the session"),
                 SummaryRow("LastZoneInit.ServerId", zoneInit.HasCapturedPacket ? zoneInit.ServerId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.ServerId : 0, "Server id from the last captured ZoneInit packet; old EurekaHelper-style shard research should compare this against instance and pop-range data"),
                 SummaryRow("LastZoneInit.PacketInstance", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : 0, "Packet `Instance` from the last captured ZoneInit packet"),
                 SummaryRow("LastZoneInit.PopRangeId", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : 0, "Packet `PopRangeId` from the last captured ZoneInit packet; ClientStructs notes this as the PlanMap instance id"),
                 SummaryRow("ReplayZoneInit.ServerId", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.ServerId : 0, "Server id from the ZoneInitPacket cached on ContentsReplayManager"),
-                SummaryRow("ReplayZoneInit.Instance", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : 0, "ZoneInitPacket.Instance cached on ContentsReplayManager; useful when HUD Navigator loaded after zone-in"),
+                SummaryRow("ReplayZoneInit.Instance", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.Instance : 0, "Raw replay cache; loading after zone-in does not establish its session freshness"),
                 SummaryRow("ReplayZoneInit.PopRangeId", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : 0, "ZoneInitPacket.PopRangeId cached on ContentsReplayManager"),
                 SummaryRow("GameMain.CurrentTerritoryFilterKey", gameMain == null ? 0 : gameMain->CurrentTerritoryFilterKey, gameMain == null ? 0 : gameMain->CurrentTerritoryFilterKey, "Current territory filter key from GameMain"),
                 SummaryRow("GameMain.TransitionTerritoryFilterKey", gameMain == null ? 0 : gameMain->TransitionTerritoryFilterKey, gameMain == null ? 0 : gameMain->TransitionTerritoryFilterKey, "Transition territory filter key from GameMain"),
@@ -523,7 +608,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         var proxyCurrentInstance = proxy == null ? (short)0 : proxy->GetCurrentInstance();
         var proxyCrossWorldDuty = proxy != null && proxy->IsInCrossWorldDuty();
         var zoneInit = zoneInstanceSnapshotService.GetSnapshot();
-        var replayManager = ContentsReplayManager.Instance();
+        var replayManager = TryGetReplayManager();
         var hasReplayZoneInit = replayManager != null && replayManager->ZoneInitPacket.TerritoryTypeId != 0;
         var eventFramework = EventFramework.Instance();
         var publicContentDirector = eventFramework == null ? null : eventFramework->GetPublicContentDirector();
@@ -552,13 +637,15 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("EnableNetworking", framework->EnableNetworking, framework->EnableNetworking, "Framework-side networking enable flag"),
                 SummaryRow("Proxy.GetCurrentInstance()", proxyCurrentInstance, proxyCurrentInstance, "Current instance returned by NetworkModuleProxy"),
                 SummaryRow("NetworkModule.CurrentInstance", networkModule == null ? 0 : networkModule->CurrentInstance, networkModule == null ? 0 : networkModule->CurrentInstance, "Backing short field stored in NetworkModule"),
-                SummaryRow("PreferredInstanceCandidate", preferredInstanceCandidate == 0 ? "<none>" : preferredInstanceCandidate, preferredInstanceCandidate, "First non-zero candidate from NetworkModuleProxy.GetCurrentInstance() -> NetworkModule.CurrentInstance -> Dalamud.ClientState.Instance -> LastZoneInit.PacketInstance -> ReplayZoneInit.Instance"),
+                SummaryRow("PreferredInstanceCandidate", preferredInstanceCandidate == 0 ? "<none>" : preferredInstanceCandidate, preferredInstanceCandidate, "First non-zero eligible candidate; historical packets/replay are excluded. Order: NetworkModuleProxy.GetCurrentInstance() -> NetworkModule.CurrentInstance -> Dalamud.ClientState.Instance -> LastZoneInit.PacketInstance -> ReplayZoneInit.Instance"),
                 SummaryRow("PreferredInstanceSource", preferredInstanceSource, preferredInstanceSource, "Source currently supplying PreferredInstanceCandidate"),
-                SummaryRow("PreferredServerIdCandidate", preferredServerIdCandidate == 0 ? "<none>" : preferredServerIdCandidate, preferredServerIdCandidate, "First non-zero server-id candidate from LastZoneInit.ServerId -> ReplayZoneInit.ServerId"),
+                SummaryRow("PreferredServerIdCandidate", preferredServerIdCandidate == 0 ? "<none>" : preferredServerIdCandidate, preferredServerIdCandidate, "First non-zero fresh, corroborated server-id candidate from LastZoneInit.ServerId -> ReplayZoneInit.ServerId"),
                 SummaryRow("PreferredServerIdSource", preferredServerIdSource, preferredServerIdSource, "Source currently supplying PreferredServerIdCandidate"),
-                SummaryRow("PreferredPopRangeCandidate", preferredPopRangeCandidate == 0 ? "<none>" : preferredPopRangeCandidate, preferredPopRangeCandidate, "First non-zero layout/pop-range candidate from LastZoneInit.PopRangeId -> ReplayZoneInit.PopRangeId -> PublicContent.LGBPopRange"),
+                SummaryRow("PreferredPopRangeCandidate", preferredPopRangeCandidate == 0 ? "<none>" : preferredPopRangeCandidate, preferredPopRangeCandidate, "First non-zero eligible layout/pop-range candidate; historical packet/replay values are excluded. Order: LastZoneInit.PopRangeId -> ReplayZoneInit.PopRangeId -> PublicContent.LGBPopRange"),
                 SummaryRow("PreferredPopRangeSource", preferredPopRangeSource, preferredPopRangeSource, "Source currently supplying PreferredPopRangeCandidate"),
                 SummaryRow("Dalamud.ClientState.Instance", Plugin.ClientState.Instance, Plugin.ClientState.Instance, "Dalamud client-state instance maintained from NetworkModuleProxy.SetCurrentInstance"),
+                SummaryRow("LastZoneInit.Freshness", zoneInit.Freshness, zoneInit.Freshness, "Historical packet fields remain visible; only a packet from the current session and zone generation can supply a preferred candidate"),
+                SummaryRow("ReplayZoneInit.IsCurrentContext", hasReplayZoneInit && ZoneInstanceSnapshotService.IsReplayCurrent(zoneInit, replayManager->ZoneInitPacket), hasReplayZoneInit && ZoneInstanceSnapshotService.IsReplayCurrent(zoneInit, replayManager->ZoneInitPacket), "Replay cache must match a fresh captured packet; cached territory alone does not establish the session"),
                 SummaryRow("LastZoneInit.ServerId", zoneInit.HasCapturedPacket ? zoneInit.ServerId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.ServerId : 0, "Server id from the last captured ZoneInit packet"),
                 SummaryRow("LastZoneInit.PacketInstance", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : 0, "Packet `Instance` from the last captured ZoneInit packet"),
                 SummaryRow("LastZoneInit.PopRangeId", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PopRangeId : 0, "Packet `PopRangeId` from the last captured ZoneInit packet; ClientStructs notes this as the PlanMap instance id"),
@@ -567,9 +654,9 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("ReplayZoneInit.PopRangeId", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : "<unavailable>", hasReplayZoneInit ? replayManager->ZoneInitPacket.PopRangeId : 0, "PopRangeId from the cached ZoneInitPacket"),
                 SummaryRow("Proxy.IsInCrossWorldDuty()", proxyCrossWorldDuty, proxyCrossWorldDuty, "Current cross-world duty helper result"),
                 SummaryRow("NetworkModule.IsInCrossWorldDuty", networkModule != null && networkModule->IsInCrossWorldDuty, networkModule != null && networkModule->IsInCrossWorldDuty, "Backing cross-world duty flag on NetworkModule"),
-                SummaryRow("NetworkModule.World", networkModule == null ? string.Empty : networkModule->World.ToString(), networkModule == null ? string.Empty : networkModule->World.ToString(), "World string cached by NetworkModule"),
-                SummaryRow("NetworkModule.ZoneName", networkModule == null ? string.Empty : networkModule->ZoneName.ToString(), networkModule == null ? string.Empty : networkModule->ZoneName.ToString(), "Zone-name string cached by NetworkModule"),
-                SummaryRow("FrontHost", networkModule == null ? string.Empty : networkModule->FrontHost.ToString(), networkModule == null ? string.Empty : networkModule->FrontHost.ToString(), "Current frontend host"),
+                SummaryRow("NetworkModule.World", networkModule == null ? string.Empty : ReadUtf8String(&networkModule->World), networkModule == null ? string.Empty : ReadUtf8String(&networkModule->World), "World string cached by NetworkModule"),
+                SummaryRow("NetworkModule.ZoneName", networkModule == null ? string.Empty : ReadUtf8String(&networkModule->ZoneName), networkModule == null ? string.Empty : ReadUtf8String(&networkModule->ZoneName), "Zone-name string cached by NetworkModule"),
+                SummaryRow("FrontHost", networkModule == null ? string.Empty : ReadUtf8String(&networkModule->FrontHost), networkModule == null ? string.Empty : ReadUtf8String(&networkModule->FrontHost), "Current frontend host"),
                 SummaryRow("FrontPort", networkModule == null ? 0 : networkModule->FrontPort, networkModule == null ? 0 : networkModule->FrontPort, "Current frontend port"),
                 SummaryRow("LobbyPing", networkModule == null ? 0 : networkModule->LobbyPing, networkModule == null ? 0 : networkModule->LobbyPing, "Current lobby ping reported by NetworkModule"),
                 SummaryRow("CurrentDeviceTime", FormatUnixTimestamp(networkModule == null ? 0 : networkModule->CurrentDeviceTime), networkModule == null ? 0 : networkModule->CurrentDeviceTime, "Network-module device time timestamp"),
@@ -583,7 +670,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
     private ClientStructsSheetSnapshot ReadZoneInitPacket(ClientStructsSheetDefinition definition)
     {
         var snapshot = zoneInstanceSnapshotService.GetSnapshot();
-        var replayManager = ContentsReplayManager.Instance();
+        var replayManager = TryGetReplayManager();
         var hasReplayZoneInit = replayManager != null && replayManager->ZoneInitPacket.TerritoryTypeId != 0;
         var gameMain = GameMain.Instance();
         var agentMap = TryGetAgentMap();
@@ -603,6 +690,11 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             {
                 SummaryRow("HookActive", snapshot.HookActive, snapshot.HookActive, "Whether the plugin-level UIModule.HandlePacket hook for ZoneInit is active"),
                 SummaryRow("HookUnavailableReason", string.IsNullOrWhiteSpace(snapshot.HookUnavailableReason) ? string.Empty : snapshot.HookUnavailableReason, snapshot.HookUnavailableReason, "Reason the UIModule.HandlePacket hook was unavailable or failed to install"),
+                SummaryRow("Freshness", snapshot.Freshness, snapshot.Freshness, "Raw historical values are preserved below even when they cannot describe the current zone"),
+                SummaryRow("IsCurrentContext", snapshot.IsCurrentContext, snapshot.IsCurrentContext, "Same session and zone generation, matching territory, logged in and not transitioning"),
+                SummaryRow("CaptureGeneration", snapshot.CaptureGeneration, snapshot.CaptureGeneration, "Generation of the captured packet"),
+                SummaryRow("CurrentGeneration", snapshot.CurrentGeneration, snapshot.CurrentGeneration, "Current login/zone-transition generation"),
+                SummaryRow("ReplayCache.IsCurrentContext", hasReplayZoneInit && ZoneInstanceSnapshotService.IsReplayCurrent(snapshot, replayManager->ZoneInitPacket), hasReplayZoneInit && ZoneInstanceSnapshotService.IsReplayCurrent(snapshot, replayManager->ZoneInitPacket), "Replay data is corroborated only when it matches the current captured packet"),
                 SummaryRow("HasCapturedPacket", snapshot.HasCapturedPacket, snapshot.HasCapturedPacket, "Whether a ZoneInit packet has been seen since the plugin loaded"),
                 SummaryRow("CapturedAtUtc", snapshot.HasCapturedPacket ? snapshot.CapturedAtUtc.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : "<unavailable>", snapshot.HasCapturedPacket ? snapshot.CapturedAtUtc.ToString("O", CultureInfo.InvariantCulture) : string.Empty, "UTC timestamp of the last captured ZoneInit packet"),
                 SummaryRow("Dalamud.ClientState.Instance", snapshot.DalamudClientStateInstance, snapshot.DalamudClientStateInstance, "Dalamud client-state instance maintained from NetworkModuleProxy.SetCurrentInstance"),
@@ -765,9 +857,9 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("ContentId", contentDirector->ContentId, contentDirector->ContentId, "Active director content id"),
                 SummaryRow("ContentFlags", contentDirector->ContentFlags, contentDirector->ContentFlags, "Raw content flags byte"),
                 SummaryRow("Sequence", contentDirector->Sequence, contentDirector->Sequence, "Current director sequence"),
-                SummaryRow("Title", contentDirector->Title.ToString(), contentDirector->Title.ToString(), "Director title text"),
-                SummaryRow("Objective", contentDirector->Objective.ToString(), contentDirector->Objective.ToString(), "Director objective text"),
-                SummaryRow("ReliefText", contentDirector->ReliefText.ToString(), contentDirector->ReliefText.ToString(), "Director relief text"),
+                SummaryRow("Title", ReadUtf8String(&contentDirector->Title), ReadUtf8String(&contentDirector->Title), "Director title text"),
+                SummaryRow("Objective", ReadUtf8String(&contentDirector->Objective), ReadUtf8String(&contentDirector->Objective), "Director objective text"),
+                SummaryRow("ReliefText", ReadUtf8String(&contentDirector->ReliefText), ReadUtf8String(&contentDirector->ReliefText), "Director relief text"),
                 SummaryRow("EventItemId", contentDirector->EventItemId, contentDirector->EventItemId, "Active event-item id"),
                 SummaryRow("DirectorStartTimestamp", FormatUnixTimestamp(contentDirector->DirectorStartTimestamp), contentDirector->DirectorStartTimestamp, "Director start timestamp"),
                 SummaryRow("DirectorEndTimestamp", FormatUnixTimestamp(contentDirector->DirectorEndTimestamp), contentDirector->DirectorEndTimestamp, "Director end timestamp"),
@@ -834,7 +926,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 Cell(todo.Complete),
                 Cell(todo.CheckOnCompletion),
                 Cell(FormatEnumValue(todo.Type), (int)todo.Type),
-                Cell(todo.Text.ToString(), todo.Text.ToString()),
+                Cell(ReadUtf8String(&todo.Text), ReadUtf8String(&todo.Text)),
                 Cell(todo.CurrentCount),
                 Cell(todo.NeededCount),
                 Cell(FormatUnixTimestamp((int)todo.EndTimestamp), todo.EndTimestamp),
@@ -889,7 +981,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         for (var i = 0; i < container->Events.Length; i++)
         {
             var dynamicEvent = container->Events[i];
-            var name = dynamicEvent.Name.ToString();
+            var name = ReadUtf8String(&dynamicEvent.Name);
             if (dynamicEvent.DynamicEventId == 0
                 && string.IsNullOrWhiteSpace(name)
                 && dynamicEvent.State == DynamicEventState.Inactive
@@ -928,8 +1020,8 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 Cell(entry.Slot),
                 Cell(dynamicEvent.DynamicEventId),
                 Cell(FormatEnumValue(dynamicEvent.State), (byte)dynamicEvent.State),
-                Cell(dynamicEvent.Name.ToString(), dynamicEvent.Name.ToString()),
-                Cell(dynamicEvent.Description.ToString(), dynamicEvent.Description.ToString()),
+                Cell(ReadUtf8String(&dynamicEvent.Name), ReadUtf8String(&dynamicEvent.Name)),
+                Cell(ReadUtf8String(&dynamicEvent.Description), ReadUtf8String(&dynamicEvent.Description)),
                 Cell(dynamicEvent.Progress),
                 Cell(dynamicEvent.Participants),
                 Cell(dynamicEvent.MaxParticipants),
@@ -957,11 +1049,11 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         var networkModule = proxy == null ? null : proxy->NetworkModule;
         var proxyCurrentInstance = proxy == null ? (short)0 : proxy->GetCurrentInstance();
         var zoneInit = zoneInstanceSnapshotService.GetSnapshot();
-        var replayManager = ContentsReplayManager.Instance();
+        var replayManager = TryGetReplayManager();
         var hasReplayZoneInit = replayManager != null && replayManager->ZoneInitPacket.TerritoryTypeId != 0;
         var agentMap = TryGetAgentMap();
         var preferredInstanceCandidate = ResolvePreferredInstanceCandidate(
-            uiState == null ? 0u : uiState->PublicInstance.InstanceId,
+            uiState != null && uiState->PublicInstance.TerritoryTypeId == Plugin.ClientState.TerritoryType ? uiState->PublicInstance.InstanceId : 0u,
             proxyCurrentInstance,
             networkModule == null ? (short)0 : networkModule->CurrentInstance,
             Plugin.ClientState.Instance,
@@ -981,16 +1073,18 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("InEurekaTerritory", gameMain != null && gameMain->CurrentTerritoryIntendedUseId == ClientTerritoryIntendedUse.Eureka, gameMain != null && gameMain->CurrentTerritoryIntendedUseId == ClientTerritoryIntendedUse.Eureka, "True when GameMain reports TerritoryIntendedUse.Eureka"),
                 SummaryRow("CurrentTerritory", gameMain == null ? "0" : ResolveTerritoryName(gameMain->CurrentTerritoryTypeId), gameMain == null ? 0 : gameMain->CurrentTerritoryTypeId, "Current territory resolved through Lumina"),
                 SummaryRow("CurrentContentFinderCondition", gameMain == null ? "0" : ResolveContentFinderConditionName(gameMain->CurrentContentFinderConditionId), gameMain == null ? 0 : gameMain->CurrentContentFinderConditionId, "Current content finder condition resolved through Lumina"),
-                SummaryRow("PreferredInstanceCandidate", preferredInstanceCandidate == 0 ? "<none>" : preferredInstanceCandidate, preferredInstanceCandidate, "First non-zero candidate from UIState.PublicInstance.InstanceId -> NetworkModuleProxy.GetCurrentInstance() -> NetworkModule.CurrentInstance -> Dalamud.ClientState.Instance -> LastZoneInit.PacketInstance -> ReplayZoneInit.Instance"),
+                SummaryRow("PreferredInstanceCandidate", preferredInstanceCandidate == 0 ? "<none>" : preferredInstanceCandidate, preferredInstanceCandidate, "First non-zero eligible candidate; historical packets/replay are excluded. Order: UIState.PublicInstance.InstanceId -> NetworkModuleProxy.GetCurrentInstance() -> NetworkModule.CurrentInstance -> Dalamud.ClientState.Instance -> LastZoneInit.PacketInstance -> ReplayZoneInit.Instance"),
                 SummaryRow("PreferredInstanceSource", preferredInstanceSource, preferredInstanceSource, "Source currently supplying PreferredInstanceCandidate"),
-                SummaryRow("PreferredServerIdCandidate", preferredServerIdCandidate == 0 ? "<none>" : preferredServerIdCandidate, preferredServerIdCandidate, "First non-zero server-id candidate from LastZoneInit.ServerId -> ReplayZoneInit.ServerId"),
+                SummaryRow("PreferredServerIdCandidate", preferredServerIdCandidate == 0 ? "<none>" : preferredServerIdCandidate, preferredServerIdCandidate, "First non-zero fresh, corroborated server-id candidate from LastZoneInit.ServerId -> ReplayZoneInit.ServerId"),
                 SummaryRow("PreferredServerIdSource", preferredServerIdSource, preferredServerIdSource, "Source currently supplying PreferredServerIdCandidate"),
-                SummaryRow("PreferredPopRangeCandidate", preferredPopRangeCandidate == 0 ? "<none>" : preferredPopRangeCandidate, preferredPopRangeCandidate, "First non-zero layout/pop-range candidate from LastZoneInit.PopRangeId -> ReplayZoneInit.PopRangeId -> PublicContentEureka.LGBPopRange"),
+                SummaryRow("PreferredPopRangeCandidate", preferredPopRangeCandidate == 0 ? "<none>" : preferredPopRangeCandidate, preferredPopRangeCandidate, "First non-zero eligible layout/pop-range candidate; historical packet/replay values are excluded. Order: LastZoneInit.PopRangeId -> ReplayZoneInit.PopRangeId -> PublicContentEureka.LGBPopRange"),
                 SummaryRow("PreferredPopRangeSource", preferredPopRangeSource, preferredPopRangeSource, "Source currently supplying PreferredPopRangeCandidate"),
                 SummaryRow("PublicInstance.InstanceId", uiState == null ? 0 : uiState->PublicInstance.InstanceId, uiState == null ? 0 : uiState->PublicInstance.InstanceId, "UIState public-instance id"),
                 SummaryRow("Network.GetCurrentInstance()", proxyCurrentInstance, proxyCurrentInstance, "NetworkModuleProxy current instance"),
                 SummaryRow("NetworkModule.CurrentInstance", networkModule == null ? 0 : networkModule->CurrentInstance, networkModule == null ? 0 : networkModule->CurrentInstance, "Backing short field stored in NetworkModule"),
                 SummaryRow("Dalamud.ClientState.Instance", Plugin.ClientState.Instance, Plugin.ClientState.Instance, "Dalamud client-state instance maintained from NetworkModuleProxy.SetCurrentInstance"),
+                SummaryRow("LastZoneInit.Freshness", zoneInit.Freshness, zoneInit.Freshness, "Historical packet fields remain visible; only a packet from the current session and zone generation can supply a preferred candidate"),
+                SummaryRow("ReplayZoneInit.IsCurrentContext", hasReplayZoneInit && ZoneInstanceSnapshotService.IsReplayCurrent(zoneInit, replayManager->ZoneInitPacket), hasReplayZoneInit && ZoneInstanceSnapshotService.IsReplayCurrent(zoneInit, replayManager->ZoneInitPacket), "Replay cache must match a fresh captured packet; cached territory alone does not establish the session"),
                 SummaryRow("LastZoneInit.ServerId", zoneInit.HasCapturedPacket ? zoneInit.ServerId : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.ServerId : 0, "Server id from the last captured ZoneInit packet; old EurekaHelper-style shard research should compare this against instance and pop-range data"),
                 SummaryRow("LastZoneInit.Instance", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.PacketInstance : 0, "Packet `Instance` from the last captured ZoneInit packet"),
                 SummaryRow("LastZoneInit.TerritoryType", zoneInit.HasCapturedPacket ? ResolveTerritoryName(zoneInit.TerritoryTypeId) : "<unavailable>", zoneInit.HasCapturedPacket ? zoneInit.TerritoryTypeId : 0, "Territory id from the last captured ZoneInit packet"),
@@ -1056,7 +1150,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("HolsterActionsLoaded", holsterCount, holsterCount, "Number of non-zero holster action ids"),
                 SummaryRow("DynamicEvent.CurrentEventId", container->CurrentEventId, container->CurrentEventId, "Current Bozja dynamic-event id"),
                 SummaryRow("DynamicEvent.CurrentEventIndex", container->CurrentEventIndex, container->CurrentEventIndex, "Current dynamic-event slot index"),
-                SummaryRow("CurrentDynamicEvent", currentEvent == null ? "<none>" : currentEvent->Name.ToString(), currentEvent == null ? string.Empty : currentEvent->Name.ToString(), "Current dynamic-event runtime name"),
+                SummaryRow("CurrentDynamicEvent", currentEvent == null ? "<none>" : ReadUtf8String(&currentEvent->Name), currentEvent == null ? string.Empty : ReadUtf8String(&currentEvent->Name), "Current dynamic-event runtime name"),
                 SummaryRow("CurrentDynamicEventState", currentEvent == null ? "<none>" : FormatEnumValue(currentEvent->State), currentEvent == null ? 0 : (byte)currentEvent->State, "Current dynamic-event runtime state"),
                 SummaryRow("CurrentDynamicEventSecondsLeft", currentEvent == null ? 0 : currentEvent->SecondsLeft, currentEvent == null ? 0 : currentEvent->SecondsLeft, "Seconds left on the current Bozja dynamic event")
             });
@@ -1395,11 +1489,11 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("CurrentMapId", agentMap->CurrentMapId, agentMap->CurrentMapId, "Current map id tracked by AgentMap"),
                 SummaryRow("SelectedTerritoryId", ResolveTerritoryName(agentMap->SelectedTerritoryId), agentMap->SelectedTerritoryId, "Selected territory tracked by AgentMap"),
                 SummaryRow("SelectedMapId", agentMap->SelectedMapId, agentMap->SelectedMapId, "Selected map id tracked by AgentMap"),
-                SummaryRow("MapTitleString", agentMap->MapTitleString.ToString(), agentMap->MapTitleString.ToString(), "Displayed map title"),
-                SummaryRow("CurrentMapPath", agentMap->CurrentMapPath.ToString(), agentMap->CurrentMapPath.ToString(), "Current map texture path"),
-                SummaryRow("CurrentMapBgPath", agentMap->CurrentMapBgPath.ToString(), agentMap->CurrentMapBgPath.ToString(), "Current map background texture path"),
-                SummaryRow("SelectedMapPath", agentMap->SelectedMapPath.ToString(), agentMap->SelectedMapPath.ToString(), "Selected map texture path"),
-                SummaryRow("SelectedMapBgPath", agentMap->SelectedMapBgPath.ToString(), agentMap->SelectedMapBgPath.ToString(), "Selected map background texture path"),
+                SummaryRow("MapTitleString", ReadUtf8String(&agentMap->MapTitleString), ReadUtf8String(&agentMap->MapTitleString), "Displayed map title"),
+                SummaryRow("CurrentMapPath", ReadUtf8String(&agentMap->CurrentMapPath), ReadUtf8String(&agentMap->CurrentMapPath), "Current map texture path"),
+                SummaryRow("CurrentMapBgPath", ReadUtf8String(&agentMap->CurrentMapBgPath), ReadUtf8String(&agentMap->CurrentMapBgPath), "Current map background texture path"),
+                SummaryRow("SelectedMapPath", ReadUtf8String(&agentMap->SelectedMapPath), ReadUtf8String(&agentMap->SelectedMapPath), "Selected map texture path"),
+                SummaryRow("SelectedMapBgPath", ReadUtf8String(&agentMap->SelectedMapBgPath), ReadUtf8String(&agentMap->SelectedMapBgPath), "Selected map background texture path"),
                 SummaryRow("CurrentMapSizeFactorFloat", agentMap->CurrentMapSizeFactorFloat.ToString("F3", CultureInfo.InvariantCulture), agentMap->CurrentMapSizeFactorFloat, "Current map size factor"),
                 SummaryRow("SelectedMapSizeFactorFloat", agentMap->SelectedMapSizeFactorFloat.ToString("F3", CultureInfo.InvariantCulture), agentMap->SelectedMapSizeFactorFloat, "Selected map size factor"),
                 SummaryRow("CurrentOffset", $"{agentMap->CurrentOffsetX}, {agentMap->CurrentOffsetY}", $"{agentMap->CurrentOffsetX},{agentMap->CurrentOffsetY}", "Current map x/y offset"),
@@ -1484,8 +1578,20 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         if (agentMap == null)
             return CreateEmptySnapshot(definition, "AgentMap is not loaded.");
 
-        var markers = agentMap->EventMarkers;
-        var totalRows = markers.Count;
+        return CaptureEventMarkers(definition, request, &agentMap->EventMarkers);
+    }
+
+    internal const int MaxRuntimeVectorRows = 4096;
+
+    internal static ClientStructsSheetSnapshot CaptureEventMarkers(ClientStructsSheetDefinition definition,
+        ClientStructsSheetRequest request, StdVector<MapMarkerData>* vector)
+    {
+        if (!NativeSheetReader.TryCopy((nint)vector, out StdVector<MapMarkerData> markers)
+            || !ClientStructRuntimeInspector.TryValidateVectorHeader((nint)markers.First, (nint)markers.Last,
+                (nint)markers.End, sizeof(MapMarkerData), out var count, out var capacity, out _)
+            || count > MaxRuntimeVectorRows || capacity > MaxRuntimeVectorRows)
+            return CreateEmptySnapshot(definition, "Event Markers unavailable: invalid or unreadable vector header/count/capacity.");
+        var totalRows = (int)count;
         var columns = CreateColumns(
             Column("Idx", "Index", "Event-marker vector index", 56f),
             Column("IconId", "uint", "Marker icon id", 84f),
@@ -1500,11 +1606,16 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             Column("Tooltip", "Utf8String", "Tooltip text when present", 260f));
 
         var visibleRows = new List<ClientStructsSheetRow>();
+        var unavailableTooltips = 0;
         BuildWindow(totalRows, request.StartIndex, request.RowCount, out var startIndex, out var rowsToLoad);
         for (var offset = 0; offset < rowsToLoad; offset++)
         {
             var rowIndex = startIndex + offset;
-            var marker = markers[rowIndex];
+            if (!ClientStructRuntimeInspector.TryAddAddress((nint)markers.First, checked(rowIndex * sizeof(MapMarkerData)), out var rowAddress)
+                || !NativeSheetReader.TryCopy(rowAddress, out MapMarkerData marker))
+                return CreateEmptySnapshot(definition, $"Event Markers unavailable: row {rowIndex} storage is unreadable.");
+            var tooltip = ReadUtf8String(marker.TooltipString);
+            if (tooltip.StartsWith("<unavailable", StringComparison.Ordinal)) unavailableTooltips++;
             visibleRows.Add(CreateRow(
                 rowIndex,
                 marker.ObjectiveId,
@@ -1518,11 +1629,15 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 Cell(marker.EventState),
                 Cell(FormatVector3(marker.Position), FormatVector3(marker.Position)),
                 Cell(marker.Radius.ToString("F1", CultureInfo.InvariantCulture), marker.Radius),
-                Cell(ReadUtf8String(marker.TooltipString), ReadUtf8String(marker.TooltipString))));
+                Cell(tooltip, tooltip)));
         }
 
+        if (!NativeSheetReader.TryCopy((nint)vector, out StdVector<MapMarkerData> after)
+            || markers.First != after.First || markers.Last != after.Last || markers.End != after.End)
+            return CreateEmptySnapshot(definition, "Event Markers unavailable: vector changed during capture.");
         var message = $"Rows {startIndex + 1}-{startIndex + visibleRows.Count} of {totalRows} - AgentMap event markers";
-        return CreateSnapshot(definition, columns, visibleRows, totalRows, startIndex, request.RowCount, $"Pointer: {FormatPointer(agentMap)}", message);
+        if (unavailableTooltips > 0) message += $"; partial: {unavailableTooltips} unavailable tooltips.";
+        return CreateSnapshot(definition, columns, visibleRows, totalRows, startIndex, request.RowCount, $"Vector: {FormatPointer(vector)}", message);
     }
 
     private ClientStructsSheetSnapshot ReadInfoModule(ClientStructsSheetDefinition definition)
@@ -1545,7 +1660,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             {
                 SummaryRow("Pointer", FormatPointer(infoModule), ((nint)infoModule).ToString("X", CultureInfo.InvariantCulture), "Singleton address"),
                 SummaryRow("LocalContentId", infoModule->GetLocalContentId(), infoModule->GetLocalContentId(), "InfoModule local content id helper"),
-                SummaryRow("LocalCharName", infoModule->LocalCharName.ToString(), infoModule->LocalCharName.ToString(), "Utf8String local character name"),
+                SummaryRow("LocalCharName", ReadUtf8String(&infoModule->LocalCharName), ReadUtf8String(&infoModule->LocalCharName), "Utf8String local character name"),
                 SummaryRow("OnlineStatusFlags", infoModule->OnlineStatusFlags, infoModule->OnlineStatusFlags, "Raw online status bitmask"),
                 SummaryRow("IsInCrossWorldDuty()", infoModule->IsInCrossWorldDuty(), infoModule->IsInCrossWorldDuty(), "Cross-world duty helper"),
                 SummaryRow("BlacklistProxyLoaded", blacklistAvailable, blacklistAvailable, "GetInfoProxyById(Blacklist) != null"),
@@ -1627,7 +1742,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             if (entry == null)
                 continue;
 
-            var name = entry->Id == 0 ? string.Empty : proxy->GetLinkshellName(entry->Id).ToString();
+            var name = entry->Id == 0 ? string.Empty : ReadCStringPointer(proxy->GetLinkshellName(entry->Id));
             var isActive = proxy->ActiveLinkShellIndex == (uint)rowIndex;
             var isSelected = selectedIndex.HasValue && selectedIndex.Value == rowIndex;
             visibleRows.Add(CreateRow(
@@ -1680,7 +1795,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 (uint)(rowIndex + 1),
                 Cell(rowIndex),
                 Cell(rowIndex + 1),
-                Cell(name == null ? string.Empty : name->ToString(), rowIndex + 1),
+                Cell(ReadUtf8String(name), rowIndex + 1),
                 Cell(FormatCrossWorldLinkshellMembershipType(entry.MembershipType), entry.MembershipType),
                 Cell(FormatUnixTimestamp(entry.FoundationTime), entry.FoundationTime),
                 Cell(isSelected)));
@@ -1758,7 +1873,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 (uint)rowIndex,
                 Cell(rowIndex),
                 Cell(entry.RetainerId),
-                Cell(entry.Name.ToString(), entry.RetainerId),
+                Cell(ReadUtf8String(&entry.Name), entry.RetainerId),
                 Cell(entry.TownId),
                 Cell(entry.SellingItems)));
         }
@@ -1774,19 +1889,30 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             return CreateEmptySnapshot(definition, "InfoModule.Instance() returned null.");
 
         var freeCompany = (InfoProxyFreeCompany*)infoModule->GetInfoProxyById(InfoProxyId.FreeCompany);
-        if (freeCompany == null)
-            return CreateEmptySnapshot(definition, "InfoProxyFreeCompany is not loaded.");
+        return CaptureFreeCompany(definition, freeCompany);
+    }
+
+    internal static ClientStructsSheetSnapshot CaptureFreeCompany(ClientStructsSheetDefinition definition, InfoProxyFreeCompany* freeCompany)
+    {
+        if (!NativeSheetReader.TryCopy((nint)freeCompany, out InfoProxyFreeCompany copy))
+            return CreateEmptySnapshot(definition, "Free Company unavailable: proxy memory is not loaded or unreadable.");
+        var address = (nint)freeCompany;
+        freeCompany = &copy;
+        string name;
+        string master;
+        fixed (byte* nameBytes = copy.Name) name = NativeSheetReader.ReadFixedString((nint)nameBytes, copy.Name.Length);
+        fixed (byte* masterBytes = copy.Master) master = NativeSheetReader.ReadFixedString((nint)masterBytes, copy.Master.Length);
 
         return CreateSummarySnapshot(
             definition,
-            $"Pointer: {FormatPointer(freeCompany)}",
+            $"Pointer: 0x{address:X}",
             "InfoProxyFreeCompany summary snapshot.",
             new[]
             {
-                SummaryRow("Pointer", FormatPointer(freeCompany), ((nint)freeCompany).ToString("X", CultureInfo.InvariantCulture), "Proxy address"),
+                SummaryRow("Pointer", $"0x{address:X}", address.ToString("X", CultureInfo.InvariantCulture), "Proxy address; values copied before inspection"),
                 SummaryRow("Id", freeCompany->Id, freeCompany->Id, "Free Company id"),
-                SummaryRow("Name", freeCompany->NameString, freeCompany->NameString, "Generated fixed-string name accessor"),
-                SummaryRow("Master", freeCompany->MasterString, freeCompany->MasterString, "Generated fixed-string master accessor"),
+                SummaryRow("Name", name, name, "Bounded copied inline name"),
+                SummaryRow("Master", master, master, "Bounded copied inline master name"),
                 SummaryRow("HomeWorldId", ResolveWorldName(freeCompany->HomeWorldId), freeCompany->HomeWorldId, "Home world resolved through Lumina when available"),
                 SummaryRow("GrandCompany", freeCompany->GrandCompany.ToString(), freeCompany->GrandCompany, "Grand Company enum"),
                 SummaryRow("Rank", freeCompany->Rank, freeCompany->Rank, "Free Company rank"),
@@ -1833,7 +1959,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("SyncedFateId", fateManager->SyncedFateId, fateManager->SyncedFateId, "Currently synced fate id"),
                 SummaryRow("GetCurrentFateId()", currentFateId, currentFateId, "Current fate id helper"),
                 SummaryRow("CurrentFate.Pointer", FormatPointer(currentFate), currentFate == null ? "0" : ((nint)currentFate).ToString("X", CultureInfo.InvariantCulture), "Current FateContext pointer"),
-                SummaryRow("CurrentFate.Name", currentFate == null ? string.Empty : currentFate->Name.ToString(), currentFate == null ? string.Empty : currentFate->Name.ToString(), "Current fate name"),
+                SummaryRow("CurrentFate.Name", currentFate == null ? string.Empty : ReadUtf8String(&currentFate->Name), currentFate == null ? string.Empty : ReadUtf8String(&currentFate->Name), "Current fate name"),
                 SummaryRow("CurrentFate.State", currentFate == null ? "<none>" : FormatEnumValue(currentFate->State), currentFate == null ? 0 : (byte)currentFate->State, "Current fate runtime state"),
                 SummaryRow("CurrentFate.Progress", currentFate == null ? 0 : currentFate->Progress, currentFate == null ? 0 : currentFate->Progress, "Current fate progress"),
                 SummaryRow("CurrentFate.Level", currentFate == null ? 0 : currentFate->Level, currentFate == null ? 0 : currentFate->Level, "Current fate level"),
@@ -1895,7 +2021,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 Cell(entry.VectorIndex),
                 Cell(fate->FateId),
                 Cell(FormatEnumValue(fate->State), (byte)fate->State),
-                Cell(fate->Name.ToString(), fate->Name.ToString()),
+                Cell(ReadUtf8String(&fate->Name), ReadUtf8String(&fate->Name)),
                 Cell(fate->Level),
                 Cell(fate->MaxLevel),
                 Cell(fate->Progress),
@@ -1978,7 +2104,7 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             var rowIndex = startIndex + offset;
             var entry = members[rowIndex];
             var member = (PartyMember*)entry.MemberPointer;
-            var name = member->NameOverride != null ? member->NameOverride->ToString() : member->NameString;
+            var name = member->NameOverride != null ? ReadUtf8String(member->NameOverride) : member->NameString;
             var blacklistMatch = GetBlacklistMatch(blacklist, member->AccountId, member->ContentId);
             visibleRows.Add(CreateRow(
                 rowIndex,
@@ -2100,7 +2226,30 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
                 SummaryRow("TargetCircle.WeaponDrawn", targetSystem->TargetCircleManager.WeaponDrawn, targetSystem->TargetCircleManager.WeaponDrawn, "Target-circle weapon state"),
                 SummaryRow("TargetCircle.CyclingEnabled", targetSystem->TargetCircleManager.CyclingEnabled, targetSystem->TargetCircleManager.CyclingEnabled, "Target-cycle enabled state"),
                 SummaryRow("TargetCircle.CustomFilterEnabled", targetSystem->TargetCircleManager.CustomFilterEnabled, targetSystem->TargetCircleManager.CustomFilterEnabled, "Custom target filter enabled state")
-            });
+            }.Concat(ReadTargetObjectDetails(targetSystem->Target)));
+    }
+
+    private static IEnumerable<ClientStructsSummaryRow> ReadTargetObjectDetails(FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject* target)
+    {
+        // Resolve only the known GameObject base. Inspecting a target never changes targeting
+        // or calls a native object method, and pointer members remain address values.
+        var snapshot = ClientStructRuntimeInspector.SnapshotStruct("Target Object", "Hard target", (nint)target,
+            typeof(FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject), "Current hard target base layout");
+        var rows = new List<ClientStructsSummaryRow>
+        {
+            SummaryRow("Target.ObjectInspection", snapshot.ResolutionInfo, snapshot.ResolutionInfo, "Bounded metadata-backed GameObject snapshot; no pointer traversal")
+        };
+        foreach (var field in snapshot.Fields)
+        {
+            var rootName = field.Name.Split('.', '[')[0];
+            if (rootName is not ("EntityId" or "LayoutId" or "GimmickId" or "EventState" or "EventId"
+                or "RenderFlags" or "NamePlateIconId" or "Position" or "Rotation" or "HitboxRadius"
+                or "ObjectKind" or "SubKind" or "OwnerId" or "TargetId"))
+                continue;
+            rows.Add(SummaryRow("Target." + field.Name, field.Value, field.Value,
+                $"{field.TypeName} +0x{field.Offset:X}: {field.Notes}"));
+        }
+        return rows;
     }
 
     private static List<ClientStructsSheetColumn> CreateMarketListingColumns()
@@ -2256,7 +2405,8 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
     private static void BuildWindow(int totalRows, int requestedStartIndex, int requestedRowCount, out int startIndex, out int rowsToLoad)
     {
         var clampedRowCount = Math.Clamp(requestedRowCount, 5, 100);
-        startIndex = Math.Clamp(requestedStartIndex, 0, Math.Max(0, totalRows - clampedRowCount));
+        // Preserve the requested offset so the final search page can be shorter than a full window.
+        startIndex = Math.Clamp(requestedStartIndex, 0, Math.Max(0, totalRows));
         rowsToLoad = Math.Min(clampedRowCount, Math.Max(0, totalRows - startIndex));
     }
 
@@ -2324,6 +2474,11 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         bool hasReplayZoneInit,
         out string source)
     {
+        if (!zoneInit.IsLoggedIn || zoneInit.IsTransitioning || zoneInit.CurrentTerritoryTypeId == 0)
+        {
+            source = "Unavailable during logout or zone transition";
+            return 0;
+        }
         if (publicInstanceId != 0)
         {
             source = "UIState.PublicInstance.InstanceId";
@@ -2348,13 +2503,13 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
             return dalamudClientStateInstance;
         }
 
-        if (zoneInit.HasCapturedPacket && zoneInit.PacketInstance != 0)
+        if (zoneInit.IsCurrentContext && zoneInit.PacketInstance != 0)
         {
             source = "LastZoneInit.PacketInstance";
             return zoneInit.PacketInstance;
         }
 
-        if (hasReplayZoneInit && replayManager != null && replayManager->ZoneInitPacket.Instance != 0)
+        if (hasReplayZoneInit && replayManager != null && ZoneInstanceSnapshotService.IsReplayCurrent(zoneInit, replayManager->ZoneInitPacket) && replayManager->ZoneInitPacket.Instance != 0)
         {
             source = "ReplayZoneInit.Instance";
             return replayManager->ZoneInitPacket.Instance;
@@ -2366,13 +2521,13 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
 
     private static ushort ResolvePreferredServerIdCandidate(ZoneInstanceSnapshot zoneInit, ContentsReplayManager* replayManager, bool hasReplayZoneInit, out string source)
     {
-        if (zoneInit.HasCapturedPacket && zoneInit.ServerId != 0)
+        if (zoneInit.IsCurrentContext && zoneInit.ServerId != 0)
         {
             source = "LastZoneInit.ServerId";
             return zoneInit.ServerId;
         }
 
-        if (hasReplayZoneInit && replayManager != null && replayManager->ZoneInitPacket.ServerId != 0)
+        if (hasReplayZoneInit && replayManager != null && ZoneInstanceSnapshotService.IsReplayCurrent(zoneInit, replayManager->ZoneInitPacket) && replayManager->ZoneInitPacket.ServerId != 0)
         {
             source = "ReplayZoneInit.ServerId";
             return replayManager->ZoneInitPacket.ServerId;
@@ -2384,13 +2539,18 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
 
     private static uint ResolvePreferredPopRangeCandidate(ZoneInstanceSnapshot zoneInit, ContentsReplayManager* replayManager, bool hasReplayZoneInit, PublicContentDirector* publicContentDirector, out string source)
     {
-        if (zoneInit.HasCapturedPacket && zoneInit.PopRangeId != 0)
+        if (!zoneInit.IsLoggedIn || zoneInit.IsTransitioning || zoneInit.CurrentTerritoryTypeId == 0)
+        {
+            source = "Unavailable during logout or zone transition";
+            return 0;
+        }
+        if (zoneInit.IsCurrentContext && zoneInit.PopRangeId != 0)
         {
             source = "LastZoneInit.PopRangeId";
             return zoneInit.PopRangeId;
         }
 
-        if (hasReplayZoneInit && replayManager != null && replayManager->ZoneInitPacket.PopRangeId != 0)
+        if (hasReplayZoneInit && replayManager != null && ZoneInstanceSnapshotService.IsReplayCurrent(zoneInit, replayManager->ZoneInitPacket) && replayManager->ZoneInitPacket.PopRangeId != 0)
         {
             source = "ReplayZoneInit.PopRangeId";
             return replayManager->ZoneInitPacket.PopRangeId;
@@ -2404,6 +2564,13 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
 
         source = "None";
         return 0;
+    }
+
+    private static ContentsReplayManager* TryGetReplayManager()
+    {
+        var manager = ContentsReplayManager.Instance();
+        return manager != null && ClientStructRuntimeInspector.IsReadableRange((nint)manager, (nuint)sizeof(ContentsReplayManager))
+            ? manager : null;
     }
 
     private static string BuildVisibleRowsCopyText(IReadOnlyList<ClientStructsSheetColumn> columns, IReadOnlyList<ClientStructsSheetRow> rows)
@@ -2542,31 +2709,10 @@ public sealed unsafe class ClientStructsSheetService : IDisposable
         => $"{value.X:F1}, {value.Y:F1}, {value.Z:F1}";
 
     private static string ReadUtf8String(Utf8String* value)
-    {
-        if (value == null)
-            return string.Empty;
-
-        try
-        {
-            return value->ToString() ?? string.Empty;
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
+        => NativeSheetReader.ReadUtf8String(value);
 
     private static string ReadCStringPointer(CStringPointer value)
-    {
-        try
-        {
-            return value.ToString() ?? string.Empty;
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
+        => NativeSheetReader.ReadCString(value);
 
     private static string ResolveItemName(uint itemId)
     {
@@ -2775,6 +2921,13 @@ public sealed class ClientStructsSearchResult
     public string RawText { get; set; } = string.Empty;
     public string DetailText { get; set; } = string.Empty;
 }
+
+public sealed record ClientStructsSearchProgress(
+    List<ClientStructsSearchResult> Results,
+    bool IsComplete,
+    int PagesRead,
+    string Status,
+    bool IsTruncated = false);
 
 public readonly record struct PartyBlacklistMatch(
     string Status,
