@@ -103,7 +103,6 @@ public class MainWindow : Window, IDisposable
     private int selectedClientStructsMasterSearchResult = -1;
     private string clientStructsMasterSearchStatus = "Enter at least 3 characters to search across all ClientStructs runtime views.";
     private string clientStructsMasterSearchLastQuery = string.Empty;
-    private DateTime clientStructsMasterSearchLastRefresh = DateTime.MinValue;
     private bool switchToClientStructsCommonView;
     private static readonly InventoryType[] ClientStructsInventoryTypes = Enum.GetValues<InventoryType>();
 
@@ -851,8 +850,6 @@ public class MainWindow : Window, IDisposable
 
         ImGui.TextDisabled("Recursive paths mirror XA addon-reader paths, while the right pane resolves live addon runtime data, generic AtkUnitBase fields, and agent/addon ClientStructs from the same selected addon.");
         ImGui.Checkbox("Auto-refresh debug", ref debugAutoRefresh);
-        ImGui.SameLine();
-        ImGui.TextDisabled($"Captured {snapshot.CapturedAtUtc:HH:mm:ss} UTC ({Math.Max(0, (DateTime.UtcNow - snapshot.CapturedAtUtc).TotalSeconds):F1}s ago)");
         foreach (var diagnostic in snapshot.Diagnostics) ImGui.TextWrapped(diagnostic);
         ImGui.Separator();
 
@@ -2215,8 +2212,6 @@ public class MainWindow : Window, IDisposable
         }
 
         ImGui.TextDisabled(clientStructsMasterSearchStatus);
-        if (clientStructsMasterSearchLastRefresh != DateTime.MinValue)
-            ImGui.TextDisabled($"Last search: {clientStructsMasterSearchLastRefresh.ToLocalTime():HH:mm:ss}");
         ImGui.Separator();
 
         var avail = ImGui.GetContentRegionAvail();
@@ -2316,7 +2311,6 @@ public class MainWindow : Window, IDisposable
         {
             if (version != searchVersion) return;
             clientStructsMasterSearchResults = progress.Results;
-            clientStructsMasterSearchLastRefresh = DateTime.UtcNow;
             selectedClientStructsMasterSearchResult = progress.Results.Count > 0 ? Math.Clamp(selectedClientStructsMasterSearchResult, 0, progress.Results.Count - 1) : -1;
             clientStructsMasterSearchStatus = progress.Status;
             if (!progress.IsComplete) QueueRuntimeSearch(filter, request, version);
@@ -2507,10 +2501,8 @@ public class MainWindow : Window, IDisposable
             RefreshSelectedClientStructsSheet();
 
         if (clientStructsSheetSnapshot == null && !sheetRead.IsPending) RefreshSelectedClientStructsSheet();
-        if (sheetRead.IsPending) ImGui.TextDisabled("Waiting for Framework capture...");
+        if (clientStructsSheetSnapshot == null && sheetRead.IsPending) ImGui.TextDisabled("Waiting for Framework capture...");
         if (!string.IsNullOrEmpty(runtimeReadError)) ImGui.TextWrapped(runtimeReadError);
-        if (clientStructsSheetLastRefresh != DateTime.MinValue)
-            ImGui.TextDisabled($"Captured {clientStructsSheetLastRefresh:HH:mm:ss} UTC ({Math.Max(0, (DateTime.UtcNow - clientStructsSheetLastRefresh).TotalSeconds):F1}s ago)");
 
         var snapshot = clientStructsSheetSnapshot;
         if (snapshot == null)

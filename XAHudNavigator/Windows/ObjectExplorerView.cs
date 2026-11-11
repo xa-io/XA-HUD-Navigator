@@ -82,8 +82,7 @@ internal sealed class ObjectExplorerView
         if (ImGui.Button("Save all JSON")) Save(frame);
         ImGui.SameLine();
         ImGui.TextDisabled("Exports include every captured object, independent of filters.");
-        var age = frame.CapturedAtUtc == DateTime.MinValue ? "not captured" : $"{Math.Max(0, (DateTime.UtcNow - frame.CapturedAtUtc).TotalSeconds):F1}s old";
-        ImGui.TextWrapped($"{frame.Status} {age} | Territory {frame.Context.TerritoryId} / Map {frame.Context.MapId} | {frame.Objects.Count}/{frame.TableLength} loaded");
+        ImGui.TextWrapped($"{frame.Status} | Territory {frame.Context.TerritoryId} / Map {frame.Context.MapId} | {frame.Objects.Count}/{frame.TableLength} loaded");
         if (!string.IsNullOrEmpty(message)) ImGui.TextWrapped(message);
         var rows = frame.Objects.Where(row => WorldObjectQuery.Matches(row, query, kind, targetableOnly, level)).ToList();
         ImGui.TextDisabled($"Showing {rows.Count}. Right-click table headers to choose columns. NPC roles require sheet evidence; current map is capture context.");

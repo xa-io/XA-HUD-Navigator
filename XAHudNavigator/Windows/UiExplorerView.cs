@@ -38,9 +38,7 @@ internal sealed class UiExplorerView
     {
         DrawControls();
         var frame = snapshots.Current;
-        var age = frame.CapturedAtUtc == DateTime.MinValue ? "not captured"
-            : $"{Math.Max(0, (DateTime.UtcNow - frame.CapturedAtUtc).TotalSeconds):F1}s old";
-        Wrapped($"{(frame.IsCurrent ? "Current capture" : "Historical / unavailable")} | {age} | Territory {frame.Context.TerritoryId} / Map {frame.Context.MapId}");
+        Wrapped($"{(frame.IsCurrent ? "Current capture" : "Historical / unavailable")} | Territory {frame.Context.TerritoryId} / Map {frame.Context.MapId}");
         Wrapped(frame.Status);
         if (message.Length > 0) Wrapped(message);
 

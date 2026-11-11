@@ -18,6 +18,9 @@ obj/
 # Backups (local development history)
 backups/
 **/backups/
+.archive/
+/archive-config.json
+xapr/
 
 # Local changelog (not committed)
 changelog.txt
@@ -32,6 +35,8 @@ dual_builds/
 .github_release_testing.staging/
 .github_release_stable.previous-*/
 .github_release_testing.previous-*/
+/.github_release.staging-*/
+/github_release.previous-*/
 
 # Internal tooling scripts (not part of the plugin source)
 *.py
